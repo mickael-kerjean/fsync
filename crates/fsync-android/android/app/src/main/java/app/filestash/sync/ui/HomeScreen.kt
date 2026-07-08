@@ -4,6 +4,12 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.provider.DocumentsContract
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -17,8 +23,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -83,14 +89,18 @@ fun HomeScreen(onLoggedOut: () -> Unit) {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
         }
         Spacer(modifier = Modifier.weight(1f))
-        FilledTonalButton(
+        Button(
             onClick = { openFileManager(context) },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.secondary,
+                contentColor = MaterialTheme.colorScheme.onSecondary,
+            ),
             shape = MaterialTheme.shapes.extraSmall,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
         ) {
-            Text("Open files")
+            Text("Browse")
         }
         TextButton(
             onClick = {
@@ -117,18 +127,28 @@ private fun StatusCircle(connected: Boolean?, onClick: () -> Unit) {
         null -> MaterialTheme.colorScheme.outline
         else -> Color(0xFF24272A)
     }
+    val pulse by rememberInfiniteTransition(label = "glow").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "glow",
+    )
+    val glow = if (connected == true) pulse else 0f
     Box(
         modifier = Modifier
             .size(168.dp)
             .clip(CircleShape)
-            .background(fill.copy(alpha = 0.14f)),
+            .background(fill.copy(alpha = 0.14f + 0.10f * glow)),
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
                 .size(146.dp)
                 .clip(CircleShape)
-                .background(fill.copy(alpha = 0.22f)),
+                .background(fill.copy(alpha = 0.22f + 0.12f * glow)),
         )
         StatusCircleCore(fill, glyph, onClick)
     }

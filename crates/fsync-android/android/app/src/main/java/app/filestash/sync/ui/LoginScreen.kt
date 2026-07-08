@@ -32,7 +32,7 @@ import app.filestash.sync.Native
 @Composable
 fun LoginScreen(onLoggedIn: () -> Unit) {
     val context = LocalContext.current
-    var url by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("https://demo.filestash.app") }
     var server by remember { mutableStateOf<String?>(null) }
 
     server?.let { base ->
@@ -56,11 +56,6 @@ fun LoginScreen(onLoggedIn: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text("Filestash", style = MaterialTheme.typography.headlineLarge)
-        Text(
-            "Connect to your server",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         OutlinedTextField(
             value = url, onValueChange = { url = it },
             label = { Text("Server") }, singleLine = true,
