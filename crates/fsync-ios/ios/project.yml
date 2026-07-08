@@ -1,0 +1,66 @@
+name: Filestash
+options:
+  bundleIdPrefix: app.filestash
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+targets:
+  Filestash:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Shared
+      - Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.filestash.ios
+    dependencies:
+      - target: FilestashFileProvider
+      - framework: Fsync.xcframework
+        embed: false
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Filestash
+        UILaunchScreen: {}
+        NSFileProviderDomainUsageDescription: Show your Filestash files in the Files app.
+    entitlements:
+      path: App/Filestash.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.app.filestash.sync
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)app.filestash.sync.shared
+  FilestashFileProvider:
+    type: app-extension
+    platform: iOS
+    sources:
+      - FileProvider
+      - Shared
+      - Generated
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.filestash.ios.fileprovider
+    dependencies:
+      - framework: Fsync.xcframework
+        embed: false
+    info:
+      path: FileProvider/Info.plist
+      properties:
+        CFBundleDisplayName: Filestash
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderReplicatedExtension: true
+    entitlements:
+      path: FileProvider/FilestashFileProvider.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.app.filestash.sync
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)app.filestash.sync.shared

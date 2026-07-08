@@ -1,0 +1,4 @@
+Generated/
+Fsync.xcframework/
+*.xcodeproj/
+build/

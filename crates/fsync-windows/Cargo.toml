@@ -1,0 +1,51 @@
+[package]
+name = "fsync-windows"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fsync-windows"
+path = "src/main.rs"
+
+[dependencies]
+fsync-core = { path = "../fsync-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+url = "2"
+
+[build-dependencies]
+resvg = { version = "0.45", default-features = false }
+embed-resource = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.5"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- icons/icon-base.svg, stroked in white and scaled into the adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <group
+        android:scaleX="0.5"
+        android:scaleY="0.5"
+        android:pivotX="256"
+        android:pivotY="256">
+        <path
+            android:pathData="M 360.51592,186.07151 C 360.34654,124.61124 307.67336,70.886448 244.72388,70.872333 c -14.73749,-0.61677 -111.7719,-0.140731 -125.63076,0 L 32.28085,162.62515 c 0.420513,25.03331 0.01412,73.59985 0,134.97543 0,61.5873 50.816943,110.92208 108.24008,110.63976 77.20754,-1.69935 108.35301,-75.9925 106.77909,-119.98443 -0.28937,-33.43332 34.18145,-98.40135 113.23002,-101.88797 l 1.43981,-0.36701 c 63.09769,0 114.23929,49.13715 114.23929,110.72446 0,61.5873 -51.1416,111.51495 -114.23929,111.51495 h -220.7996"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="49.4053"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

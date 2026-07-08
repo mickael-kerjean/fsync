@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/fsync-android",
+    "crates/fsync-core",
+    "crates/fsync-ios",
+    "crates/fsync-linux",
+    "crates/fsync-mac",
+    "crates/fsync-windows",
+]
+default-members = [
+    "crates/fsync-android",
+    "crates/fsync-core",
+    "crates/fsync-ios",
+    "crates/fsync-linux",
+    "crates/fsync-mac",
+]
+resolver = "2"

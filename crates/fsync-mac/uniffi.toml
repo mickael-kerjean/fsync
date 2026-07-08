@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "Fsync"
+ffi_module_name = "fsyncFFI"
+cdylib_name = "fsync_mac"

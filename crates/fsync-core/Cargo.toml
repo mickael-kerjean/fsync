@@ -1,0 +1,24 @@
+[package]
+name = "fsync-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "1"
+url = "2"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+httpdate = "1"
+bytes = "1"
+log = "0.4"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "fs"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+httpmock = "0.7"
+futures-util = "0.3"
