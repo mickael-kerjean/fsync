@@ -99,6 +99,7 @@ pub struct Adapter {
     root: PathBuf,
     refreshing: Mutex<BTreeMap<RelPath, Instant>>,
     kept: Mutex<BTreeSet<RelPath>>,
+    pinning: Mutex<BTreeSet<RelPath>>,
 }
 
 impl Adapter {
@@ -120,6 +121,7 @@ impl Adapter {
             root,
             refreshing: Mutex::new(BTreeMap::new()),
             kept: Mutex::new(BTreeSet::new()),
+            pinning: Mutex::new(BTreeSet::new()),
         }))
     }
 
@@ -157,14 +159,48 @@ impl Adapter {
         Ok(())
     }
 
+    pub async fn resync(self: &Arc<Self>) -> io::Result<()> {
+        log::info!("manual refresh: re-listing populated tree");
+        let mut pending = vec![RelPath::root()];
+        while let Some(dir) = pending.pop() {
+            self.refresh(&dir).await?;
+            let this = self.clone();
+            let at = dir.clone();
+            let mut children =
+                tokio::task::spawn_blocking(move || this.populated_subdirs(&at)).await?;
+            pending.append(&mut children);
+        }
+        log::info!("manual refresh: done");
+        Ok(())
+    }
+
+    fn populated_subdirs(&self, dir: &RelPath) -> Vec<RelPath> {
+        let mut dirs = Vec::new();
+        let Ok(read) = fs::read_dir(self.abs(dir)) else {
+            return dirs;
+        };
+        for entry in read.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(md) = entry.metadata() else { continue };
+            if !md.is_dir() {
+                continue;
+            }
+            match wire::placeholder_state(&entry.path()) {
+                Ok(st) if st.placeholder && st.partial => continue,
+                _ => dirs.push(dir.join(&name)),
+            }
+        }
+        dirs
+    }
+
     fn abs(&self, path: &RelPath) -> PathBuf {
         wire::abs_of(&self.root, path)
     }
 
     fn classify(&self, abs: &Path, path: &RelPath) -> io::Result<FileState> {
-        use windows::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_UNPINNED,
-        };
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
         let md = fs::symlink_metadata(abs)?;
         let ps = wire::placeholder_state(abs)?;
         if !ps.placeholder {
@@ -178,18 +214,11 @@ impl Adapter {
             return Ok(FileState::Edited);
         }
         let attrs = std::os::windows::fs::MetadataExt::file_attributes(&md);
-        let pin = if attrs & FILE_ATTRIBUTE_PINNED.0 != 0 {
-            Pin::Pinned
-        } else if attrs & FILE_ATTRIBUTE_UNPINNED.0 != 0 {
-            Pin::Unpinned
-        } else {
-            Pin::Unspecified
-        };
         Ok(
             if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.0 != 0 || ps.partial {
-                FileState::Dehydrated(pin)
+                FileState::Dehydrated(pin_of(&md))
             } else {
-                FileState::Cached(pin)
+                FileState::Cached(pin_of(&md))
             },
         )
     }
@@ -290,7 +319,7 @@ impl Adapter {
             .block_on(self.engine.rename(from, to, is_dir))
     }
 
-    pub async fn on_change(&self, path: &RelPath) {
+    pub async fn on_change(self: &Arc<Self>, path: &RelPath) {
         let abs = self.abs(path);
         let Ok(md) = fs::symlink_metadata(&abs) else {
             return;
@@ -310,6 +339,10 @@ impl Adapter {
                         log::debug!("convert dir {what}: {err}");
                     }
                 });
+            } else if pin_of(&md) == Pin::Pinned {
+                let this = self.clone();
+                let what = path.clone();
+                tokio::task::spawn_blocking(move || this.pin_subtree(&what));
             }
             return;
         }
@@ -318,6 +351,13 @@ impl Adapter {
         };
         match fstate {
             FileState::Edited | FileState::New => self.engine.modified(path),
+            FileState::Dehydrated(Pin::Pinned) => {
+                let what = path.clone();
+                tokio::task::spawn_blocking(move || match wire::set_hydration(&abs, true) {
+                    Ok(()) => log::info!("hydrated {what} (pinned)"),
+                    Err(err) => log::warn!("hydrate {what}: {err}"),
+                });
+            }
             FileState::Cached(Pin::Unpinned) => {
                 let what = path.clone();
                 tokio::task::spawn_blocking(move || match wire::set_hydration(&abs, false) {
@@ -584,8 +624,9 @@ impl Adapter {
     fn sweep(&self) -> Vec<RelPath> {
         let mut armed = Vec::new();
         let mut dehydrated = 0u32;
-        let mut pending = vec![RelPath::root()];
-        while let Some(dir) = pending.pop() {
+        let mut hydrated = 0u32;
+        let mut pending = vec![(RelPath::root(), false)];
+        while let Some((dir, inherited)) = pending.pop() {
             let Ok(read) = fs::read_dir(self.abs(&dir)) else {
                 continue;
             };
@@ -596,10 +637,24 @@ impl Adapter {
                 let child = dir.join(&name);
                 let abs = entry.path();
                 let Ok(md) = entry.metadata() else { continue };
+                let pin = match pin_of(&md) {
+                    Pin::Unspecified if inherited => match wire::set_pinned(&abs) {
+                        Ok(()) => Pin::Pinned,
+                        Err(err) => {
+                            log::debug!("pin {child}: {err}");
+                            Pin::Unspecified
+                        }
+                    },
+                    pin => pin,
+                };
                 if md.is_dir() {
                     match wire::placeholder_state(&abs) {
-                        Ok(st) if st.placeholder && st.partial => {}
-                        _ => pending.push(child),
+                        Ok(st) if st.placeholder && st.partial => {
+                            if pin == Pin::Pinned {
+                                pending.push((child, true));
+                            }
+                        }
+                        _ => pending.push((child, pin == Pin::Pinned)),
                     }
                     continue;
                 }
@@ -607,6 +662,10 @@ impl Adapter {
                     Ok(FileState::Edited) if self.engine.ledger().dirty_set(&child) => {
                         armed.push(child);
                     }
+                    Ok(FileState::Dehydrated(Pin::Pinned)) => match wire::set_hydration(&abs, true) {
+                        Ok(()) => hydrated += 1,
+                        Err(err) => log::debug!("hydrate {child}: {err}"),
+                    },
                     Ok(FileState::Cached(Pin::Unpinned)) => match wire::set_hydration(&abs, false) {
                         Ok(()) => dehydrated += 1,
                         Err(err) => log::debug!("dehydrate {child}: {err}"),
@@ -615,10 +674,54 @@ impl Adapter {
                 }
             }
         }
-        if dehydrated > 0 {
-            log::info!("pin sweep: {dehydrated} dehydrated");
+        if dehydrated > 0 || hydrated > 0 {
+            log::info!("pin sweep: {hydrated} hydrated, {dehydrated} dehydrated");
         }
         armed
+    }
+
+    fn pin_subtree(&self, dir: &RelPath) {
+        {
+            let mut pinning = self.pinning.lock().unwrap();
+            if pinning.iter().any(|p| p == dir || dir.is_descendant_of(p)) {
+                return;
+            }
+            pinning.insert(dir.clone());
+        }
+        self.pin_walk(dir);
+        self.pinning.lock().unwrap().remove(dir);
+    }
+
+    fn pin_walk(&self, dir: &RelPath) {
+        let Ok(read) = fs::read_dir(self.abs(dir)) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let child = dir.join(&name);
+            let abs = entry.path();
+            let Ok(md) = entry.metadata() else { continue };
+            match pin_of(&md) {
+                Pin::Unpinned => continue,
+                Pin::Pinned => {}
+                Pin::Unspecified => {
+                    if let Err(err) = wire::set_pinned(&abs) {
+                        log::debug!("pin {child}: {err}");
+                        continue;
+                    }
+                }
+            }
+            if md.is_dir() {
+                self.pin_walk(&child);
+            } else if matches!(self.classify(&abs, &child), Ok(FileState::Dehydrated(_))) {
+                match wire::set_hydration(&abs, true) {
+                    Ok(()) => log::info!("hydrated {child} (pinned)"),
+                    Err(err) => log::warn!("hydrate {child}: {err}"),
+                }
+            }
+        }
     }
 
     pub fn vacuum(&self) -> io::Result<()> {
@@ -668,5 +771,17 @@ impl Adapter {
             }
         }
         Ok(emptied)
+    }
+}
+
+fn pin_of(md: &fs::Metadata) -> Pin {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_UNPINNED};
+    let attrs = std::os::windows::fs::MetadataExt::file_attributes(md);
+    if attrs & FILE_ATTRIBUTE_PINNED.0 != 0 {
+        Pin::Pinned
+    } else if attrs & FILE_ATTRIBUTE_UNPINNED.0 != 0 {
+        Pin::Unpinned
+    } else {
+        Pin::Unspecified
     }
 }

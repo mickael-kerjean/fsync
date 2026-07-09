@@ -34,6 +34,7 @@ pub struct Setup {
     pub prefill_url: Option<String>,
     pub credentials: Option<Credentials>,
     pub prompt_login: bool,
+    pub fresh_credentials: bool,
 }
 
 pub fn init() -> Result<Option<Setup>, Box<dyn std::error::Error>> {
@@ -60,7 +61,9 @@ pub fn init() -> Result<Option<Setup>, Box<dyn std::error::Error>> {
         .join("Filestash");
     std::fs::create_dir_all(&data)?;
 
-    match setup(args, fdrive_core::config::recall(&data).map(Credentials::from), root, data) {
+    let stored = fdrive_core::config::recall(&data).map(Credentials::from);
+    let stored_server = fdrive_core::config::recall_server(&data);
+    match setup(args, stored, stored_server, root, data) {
         Ok(setup) => Ok(Some(setup)),
         Err(err) => {
             gui::alert(&err);
@@ -72,6 +75,7 @@ pub fn init() -> Result<Option<Setup>, Box<dyn std::error::Error>> {
 fn setup(
     args: Args,
     stored: Option<Credentials>,
+    stored_server: Option<String>,
     root: PathBuf,
     data: PathBuf,
 ) -> Result<Setup, String> {
@@ -103,6 +107,7 @@ fn setup(
         (Some(_), None, None) => None,
         (None, ..) => stored,
     };
+    let fresh_credentials = server.is_some() && credentials.is_some();
     let config_path = args.config.unwrap_or_else(|| data.join("fdrive.toml"));
     Ok(Setup {
         root,
@@ -110,7 +115,8 @@ fn setup(
         config_path,
         unregister: args.unregister,
         prompt_login: server.is_some() && credentials.is_none(),
-        prefill_url: server,
+        prefill_url: server.or(stored_server),
         credentials,
+        fresh_credentials,
     })
 }

@@ -284,16 +284,15 @@ fn state_of_handle(handle: HANDLE) -> io::Result<PlaceholderState> {
 }
 
 pub fn delete_if_clean(abs: &Path) -> io::Result<()> {
-    use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Storage::FileSystem::{
         FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
-        FILE_SHARE_MODE,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_MODE,
     };
     let abs_w = wide(abs.as_os_str());
     let handle = unsafe {
         CreateFileW(
             PCWSTR(abs_w.as_ptr()),
-            DELETE.0 | GENERIC_READ.0,
+            DELETE.0 | FILE_READ_ATTRIBUTES.0,
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,

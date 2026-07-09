@@ -65,6 +65,7 @@ impl From<fdrive_core::config::Session> for Credentials {
 #[derive(Debug)]
 pub enum TrayEvent {
     Browse,
+    Refresh,
     Login(Credentials),
     Logout,
     Restart,
@@ -108,6 +109,7 @@ pub struct TrayState {
     pub storage: String,
 }
 
+#[derive(Clone)]
 pub struct Tray {
     state: Arc<Mutex<TrayState>>,
     thread: u32,
@@ -148,6 +150,7 @@ const CMD_RESTART: usize = 4;
 const CMD_QUIT: usize = 5;
 const CMD_LOGS: usize = 6;
 const CMD_AUTOSTART: usize = 7;
+const CMD_REFRESH: usize = 8;
 
 struct Ctx {
     state: Arc<Mutex<TrayState>>,
@@ -361,6 +364,7 @@ unsafe fn show_menu(hwnd: HWND) {
     };
     if logged_in {
         let _ = AppendMenuW(menu, MF_STRING, CMD_BROWSE, w!("Browse"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_REFRESH, w!("Refresh"));
         let _ = AppendMenuW(menu, MF_STRING, CMD_LOGS, w!("Logs"));
         let _ = AppendMenuW(menu, autostart, CMD_AUTOSTART, w!("Autostart"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -393,6 +397,7 @@ unsafe fn show_menu(hwnd: HWND) {
     };
     match picked.0 as usize {
         CMD_BROWSE => send(TrayEvent::Browse),
+        CMD_REFRESH => send(TrayEvent::Refresh),
         CMD_LOGIN => prompt_login(),
         CMD_LOGOUT => send(TrayEvent::Logout),
         CMD_LOGS => CTX.with_borrow(|ctx| {

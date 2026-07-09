@@ -63,6 +63,11 @@ pub fn recall(data: &Path) -> Option<Session> {
     (!session.url.is_empty() && !session.token.is_empty()).then_some(session)
 }
 
+pub fn recall_server(data: &Path) -> Option<String> {
+    let session = load::<ConfigFile>(&data.join(FILE))?.session?;
+    (!session.url.is_empty()).then_some(session.url)
+}
+
 pub fn remember(data: &Path, url: &str, token: &str, insecure: bool) {
     if url.is_empty() || token.is_empty() {
         return;
@@ -78,7 +83,13 @@ pub fn remember(data: &Path, url: &str, token: &str, insecure: bool) {
 }
 
 pub fn forget(data: &Path) {
-    update(data, None);
+    let kept = load::<ConfigFile>(&data.join(FILE))
+        .and_then(|config| config.session)
+        .map(|session| Session {
+            token: String::new(),
+            ..session
+        });
+    update(data, kept);
 }
 
 fn update(data: &Path, session: Option<Session>) {

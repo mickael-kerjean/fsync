@@ -53,6 +53,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prefill_url,
         mut credentials,
         prompt_login,
+        fresh_credentials,
     } = setup;
     log::init(&data)?;
     std::panic::set_hook(Box::new(|info| {
@@ -88,19 +89,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tray.prompt_login();
     }
 
+    let mut browse_on_connect = fresh_credentials;
     let restart = loop {
         set_tray(&tray, credentials.as_ref());
         let end = match &credentials {
-            Some(creds) => session(creds, &config, &root, &data, &mut events, &tray)
-                .await
-                .unwrap_or_else(|err| {
-                    log::error!("session: {err}");
-                    SessionEnd::Failed
-                }),
+            Some(creds) => {
+                let browse = std::mem::take(&mut browse_on_connect);
+                session(creds, &config, &root, &data, &mut events, &tray, browse)
+                    .await
+                    .unwrap_or_else(|err| {
+                        log::error!("session: {err}");
+                        SessionEnd::Failed
+                    })
+            }
             None => match events.recv().await {
                 None => SessionEnd::Quit,
                 Some(TrayEvent::Login(creds)) => {
                     credentials = Some(creds);
+                    browse_on_connect = true;
                     continue;
                 }
                 Some(TrayEvent::Browse) => {
@@ -109,7 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Some(TrayEvent::Restart) => SessionEnd::Restart,
                 Some(TrayEvent::Quit) => SessionEnd::Quit,
-                Some(TrayEvent::Logout) => continue,
+                Some(TrayEvent::Logout) | Some(TrayEvent::Refresh) => continue,
             },
         };
         match end {
@@ -167,6 +173,7 @@ async fn session(
     data: &Path,
     events: &mut UnboundedReceiver<TrayEvent>,
     tray: &Tray,
+    browse: bool,
 ) -> Result<SessionEnd, Box<dyn std::error::Error>> {
     let builder = Sdk::builder(&creds.url).insecure(creds.insecure);
     let sdk = if creds.token.is_empty() {
@@ -189,6 +196,9 @@ async fn session(
     let sync_root_id = register_sync_root(config, creds, root)?;
     let connection = adapter.connect(root)?;
     log::info!("sync root {} connected", root.display());
+    if browse {
+        gui::open_folder(root);
+    }
 
     let (changes_tx, mut changes) = tokio::sync::mpsc::unbounded_channel();
     watcher::spawn(root, changes_tx)?;
@@ -212,6 +222,22 @@ async fn session(
                     Some(TrayEvent::Logout) => break SessionEnd::Logout,
                     Some(TrayEvent::Restart) => break SessionEnd::Restart,
                     Some(TrayEvent::Browse) => gui::open_folder(root),
+                    Some(TrayEvent::Refresh) => {
+                        let adapter = adapter.clone();
+                        let tray = tray.clone();
+                        let status = adapter.upload_status();
+                        tokio::spawn(async move {
+                            tray.set_status(Status::Syncing);
+                            if let Err(err) = adapter.resync().await {
+                                log::warn!("refresh: {err}");
+                            }
+                            tray.set_status(match *status.borrow() {
+                                UploadStatus::Idle => Status::Ok,
+                                UploadStatus::Busy => Status::Syncing,
+                                UploadStatus::Error => Status::Error,
+                            });
+                        });
+                    }
                     Some(TrayEvent::Login(_)) => {}
                 }
             },
@@ -256,10 +282,10 @@ async fn session(
     log::info!("disconnecting");
     adapter.flush(Duration::from_secs(30)).await;
     if matches!(end, SessionEnd::Logout) {
+        connection.disconnect();
         if let Err(err) = adapter.vacuum() {
             log::warn!("vacuum on logout: {err}");
         }
-        connection.disconnect();
         match shell::unregister(&sync_root_id) {
             Ok(()) => log::info!("sync root unregistered"),
             Err(err) => log::warn!("unregister on logout: {err}"),
