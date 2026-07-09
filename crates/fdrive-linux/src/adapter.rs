@@ -172,17 +172,32 @@ impl Adapter {
     }
 
     pub fn hydrate(&self, path: &RelPath) -> io::Result<()> {
-        if let Ok(listing) = self.ls(&path.parent_or_root()) {
-            if let Some(entry) = listing.iter().find(|e| e.name == path.name()) {
-                if self.engine.content_current(path, Observation::of(entry)) {
-                    return Ok(());
-                }
-            }
+        if self.content_current(path) {
+            return Ok(());
         }
         self.engine.rt().block_on(self.engine.hydrate(path))
     }
 
+    pub fn hydrate_start(&self, path: &RelPath) -> io::Result<()> {
+        if self.content_current(path) {
+            return Ok(());
+        }
+        self.engine.rt().block_on(self.engine.hydrate_start(path))
+    }
+
+    fn content_current(&self, path: &RelPath) -> bool {
+        if let Ok(listing) = self.ls(&path.parent_or_root()) {
+            if let Some(entry) = listing.iter().find(|e| e.name == path.name()) {
+                return self.engine.content_current(path, Observation::of(entry));
+            }
+        }
+        false
+    }
+
     pub fn read(&self, path: &RelPath, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+        if let Some(download) = self.engine.download(path) {
+            return self.engine.rt().block_on(download.read(offset, size));
+        }
         let mut file = fs::File::open(self.backing(path))?;
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = Vec::with_capacity(size as usize);

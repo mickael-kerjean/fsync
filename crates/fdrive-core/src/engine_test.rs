@@ -656,3 +656,37 @@ async fn concurrent_hydrates_download_once() {
     cat.assert_hits(1);
     assert_eq!(engine.tree().read("f").unwrap(), b"hello");
 }
+
+#[tokio::test]
+async fn reads_are_served_while_the_download_is_in_flight() {
+    let server = MockServer::start();
+    let mtime = "Wed, 21 Oct 2015 07:28:00 GMT";
+    server.mock(|when, then| {
+        when.method(Method::HEAD)
+            .path("/api/files/cat")
+            .query_param("path", "/f");
+        then.status(200)
+            .header("content-length", "11")
+            .header("last-modified", mtime);
+    });
+    server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/files/cat")
+            .query_param("path", "/f");
+        then.status(200)
+            .body("hello world")
+            .delay(std::time::Duration::from_millis(300));
+    });
+    let engine = engine(&server);
+    let path = RelPath::new("f");
+
+    engine.hydrate_start(&path).await.unwrap();
+    assert!(
+        engine.tree().read("f").is_none(),
+        "hydrate_start returned before the file was cached"
+    );
+    let download = engine.download(&path).expect("download is in flight");
+    assert_eq!(download.read(0, 5).await.unwrap(), b"hello");
+    download.done().await.unwrap();
+    assert_eq!(engine.tree().read("f").unwrap(), b"hello world");
+}

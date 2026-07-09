@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::TryStreamExt;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -15,253 +14,17 @@ use crate::port::LocalTree;
 use crate::scheduler::{self, Msg, UploadStatus};
 use crate::sdk::{Error as SdkError, FileInfo, Sdk};
 
-pub enum Upload {
-    Done,
-    Retry,
-}
+#[path = "engine_ledger.rs"]
+mod ledger;
+pub use ledger::{Ledger, Observation};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Observation {
-    pub size: u64,
-    pub time: u64,
-}
+#[path = "engine_download.rs"]
+mod download;
+pub use download::{Download, DownloadStatus};
 
-impl Observation {
-    pub fn new(size: u64, mtime: Option<SystemTime>) -> Self {
-        Self {
-            size,
-            time: secs(mtime),
-        }
-    }
-
-    pub fn of(info: &FileInfo) -> Self {
-        Self::new(info.size.unwrap_or(0), info.mtime)
-    }
-
-    pub fn of_local(md: &fs::Metadata) -> Self {
-        Self::new(md.len(), md.modified().ok())
-    }
-}
-
-fn secs(t: Option<SystemTime>) -> u64 {
-    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-#[derive(Default)]
-pub struct Ledger {
-    pub observations: BTreeMap<RelPath, Observation>,
-    pub dirty: BTreeSet<RelPath>,
-    db: Option<rusqlite::Connection>,
-}
-
-const SUBTREE: &str = "path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')";
-
-pub fn open_db(file: &Path, schema: &str) -> rusqlite::Result<rusqlite::Connection> {
-    let db = rusqlite::Connection::open(file)?;
-    db.busy_timeout(Duration::from_secs(5))?;
-    db.pragma_update(None, "synchronous", "OFF")?;
-    let _: String = db.query_row("PRAGMA journal_mode=MEMORY", [], |row| row.get(0))?;
-    db.execute_batch(schema)?;
-    Ok(db)
-}
-
-impl Ledger {
-    pub fn open(file: &Path) -> Result<Self, ()> {
-        let load = || -> rusqlite::Result<Self> {
-            let db = open_db(
-                file,
-                "CREATE TABLE IF NOT EXISTS observations(path TEXT PRIMARY KEY, size INTEGER NOT NULL, time INTEGER NOT NULL);
-                 CREATE TABLE IF NOT EXISTS dirty(path TEXT PRIMARY KEY);",
-            )?;
-            let mut ledger = Ledger::default();
-            {
-                let mut stmt = db.prepare("SELECT path, size, time FROM observations")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let path: String = row.get(0)?;
-                    let (size, time): (i64, i64) = (row.get(1)?, row.get(2)?);
-                    ledger.observations.insert(
-                        RelPath::new(&path),
-                        Observation {
-                            size: size as u64,
-                            time: time as u64,
-                        },
-                    );
-                }
-                let mut stmt = db.prepare("SELECT path FROM dirty")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let path: String = row.get(0)?;
-                    ledger.dirty.insert(RelPath::new(&path));
-                }
-            }
-            ledger.db = Some(db);
-            Ok(ledger)
-        };
-        load().map_err(|err| log::error!("{} is unreadable: {err}", file.display()))
-    }
-
-    fn exec(&self, sql: &str, params: impl rusqlite::Params) {
-        if let Some(db) = &self.db {
-            if let Err(err) = db.execute(sql, params) {
-                log::error!("ledger: {err}");
-            }
-        }
-    }
-
-    pub fn dirty_set(&mut self, path: &RelPath) -> bool {
-        let inserted = self.dirty.insert(path.clone());
-        if inserted {
-            self.exec("INSERT OR IGNORE INTO dirty(path) VALUES (?1)", [path.as_str()]);
-        }
-        inserted
-    }
-
-    pub fn dirty_clear(&mut self, path: &RelPath) {
-        if self.dirty.remove(path) {
-            self.exec("DELETE FROM dirty WHERE path = ?1", [path.as_str()]);
-        }
-    }
-
-    pub fn observe(&mut self, path: &RelPath, obs: Observation) {
-        self.observations.insert(path.clone(), obs);
-        self.exec(
-            "INSERT OR REPLACE INTO observations(path, size, time) VALUES (?1, ?2, ?3)",
-            rusqlite::params![path.as_str(), obs.size as i64, obs.time as i64],
-        );
-    }
-
-    pub fn unobserve(&mut self, path: &RelPath) {
-        if self.observations.remove(path).is_some() {
-            self.exec("DELETE FROM observations WHERE path = ?1", [path.as_str()]);
-        }
-    }
-
-    pub fn forget(&mut self, path: &RelPath) {
-        self.observations
-            .retain(|p, _| p != path && !p.is_descendant_of(path));
-        self.dirty
-            .retain(|p| p != path && !p.is_descendant_of(path));
-        self.exec(
-            &format!("DELETE FROM observations WHERE {SUBTREE}"),
-            [path.as_str()],
-        );
-        self.exec(&format!("DELETE FROM dirty WHERE {SUBTREE}"), [path.as_str()]);
-    }
-
-    pub fn remap(&mut self, from: &RelPath, to: &RelPath) {
-        let rebase =
-            |p: &RelPath| RelPath::new(&p.as_str().replacen(from.as_str(), to.as_str(), 1));
-        let moved: Vec<RelPath> = self
-            .observations
-            .keys()
-            .filter(|p| *p == from || p.is_descendant_of(from))
-            .cloned()
-            .collect();
-        for p in moved {
-            let record = self.observations.remove(&p).unwrap();
-            self.exec("DELETE FROM observations WHERE path = ?1", [p.as_str()]);
-            let dest = rebase(&p);
-            self.exec(
-                "INSERT OR REPLACE INTO observations(path, size, time) VALUES (?1, ?2, ?3)",
-                rusqlite::params![dest.as_str(), record.size as i64, record.time as i64],
-            );
-            self.observations.insert(dest, record);
-        }
-        let moved: Vec<RelPath> = self
-            .dirty
-            .iter()
-            .filter(|p| *p == from || p.is_descendant_of(from))
-            .cloned()
-            .collect();
-        for p in moved {
-            self.dirty.remove(&p);
-            self.exec("DELETE FROM dirty WHERE path = ?1", [p.as_str()]);
-            let dest = rebase(&p);
-            self.exec("INSERT OR REPLACE INTO dirty(path) VALUES (?1)", [dest.as_str()]);
-            self.dirty.insert(dest);
-        }
-    }
-
-    pub fn local_only(&self, path: &RelPath) -> bool {
-        !self.observations.contains_key(path) && self.dirty.contains(path)
-    }
-}
-
-pub async fn save_with_parents(sdk: &Sdk, target: &RelPath, source: &Path) -> io::Result<()> {
-    match sdk
-        .save(&target.as_file(), crate::file_stream(source).await?)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(SdkError::NotFound | SdkError::PermissionDenied) => {
-            let mut ancestors = vec![];
-            let mut cur = target.parent_or_root();
-            while !cur.is_root() {
-                ancestors.push(cur.clone());
-                cur = cur.parent_or_root();
-            }
-            for dir in ancestors.iter().rev() {
-                if let Err(err) = sdk.mkdir(&dir.as_dir()).await {
-                    log::debug!("mkdirs {dir}: {err}");
-                }
-            }
-            sdk.save(&target.as_file(), crate::file_stream(source).await?)
-                .await
-                .map_err(io_err)
-        }
-        Err(err) => Err(io_err(err)),
-    }
-}
-
-fn part_file(abs: &Path) -> PathBuf {
-    use std::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut tmp = abs.as_os_str().to_owned();
-    tmp.push(format!(".{}.part", COUNTER.fetch_add(1, Ordering::Relaxed)));
-    PathBuf::from(tmp)
-}
-
-async fn download(sdk: &Sdk, path: &RelPath, tmp: &Path) -> io::Result<u64> {
-    let mut stream = sdk.cat(&path.as_file()).await.map_err(io_err)?;
-    let mut file = fs::File::create(tmp)?;
-    let mut size: u64 = 0;
-    while let Some(chunk) = stream.try_next().await? {
-        io::Write::write_all(&mut file, &chunk)?;
-        size += chunk.len() as u64;
-    }
-    Ok(size)
-}
-
-pub fn io_err(err: SdkError) -> io::Error {
-    match err {
-        SdkError::NotFound => io::ErrorKind::NotFound.into(),
-        SdkError::PermissionDenied => io::ErrorKind::PermissionDenied.into(),
-        err => io::Error::other(err),
-    }
-}
-
-fn prune_dir(dir: &Path, keep: &[PathBuf]) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if keep.iter().any(|k| k == &path) {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            if keep.iter().any(|k| k.starts_with(&path)) {
-                prune_dir(&path, keep)?;
-            } else {
-                fs::remove_dir_all(&path)?;
-            }
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
+#[path = "engine_upload.rs"]
+mod upload;
+pub use upload::{save_with_parents, Upload};
 
 #[cfg(test)]
 #[path = "engine_test.rs"]
@@ -277,6 +40,8 @@ pub struct Engine<T: LocalTree> {
     queue: mpsc::UnboundedSender<Msg>,
     status: watch::Receiver<UploadStatus>,
     hydrating: Mutex<HashMap<RelPath, Arc<tokio::sync::Mutex<()>>>>,
+    downloads: Mutex<HashMap<RelPath, Arc<Download>>>,
+    weak: Weak<Engine<T>>,
 }
 
 impl<T: LocalTree> Engine<T> {
@@ -304,6 +69,8 @@ impl<T: LocalTree> Engine<T> {
                 queue,
                 status,
                 hydrating: Mutex::new(HashMap::new()),
+                downloads: Mutex::new(HashMap::new()),
+                weak: weak.clone(),
             }
         })
     }
@@ -359,70 +126,6 @@ impl<T: LocalTree> Engine<T> {
             }
         }
         listing
-    }
-
-    pub async fn hydrate(&self, path: &RelPath) -> io::Result<()> {
-        let gate = self.hydrating.lock().unwrap().entry(path.clone()).or_default().clone();
-        let _gate = gate.lock().await;
-        let result = self.fetch(path).await;
-        let mut hydrating = self.hydrating.lock().unwrap();
-        if hydrating.get(path).is_some_and(|e| Arc::strong_count(e) <= 2) {
-            hydrating.remove(path);
-        }
-        result
-    }
-
-    async fn fetch(&self, path: &RelPath) -> io::Result<()> {
-        let (observed, dirty) = {
-            let ledger = self.ledger();
-            (
-                ledger.observations.get(path).copied(),
-                ledger.dirty.contains(path),
-            )
-        };
-        if dirty {
-            return Ok(());
-        }
-        let current = match self.sdk.stat(&path.as_file()).await {
-            Ok(info) => Observation::of(&info),
-            Err(err) => return Err(io_err(err)),
-        };
-        let abs = self.tree.backing(path);
-        if observed == Some(current) && abs.is_file() {
-            return Ok(());
-        }
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let tmp = part_file(&abs);
-        let size = match download(&self.sdk, path, &tmp).await {
-            Ok(size) => size,
-            Err(err) => {
-                let _ = fs::remove_file(&tmp);
-                return Err(err);
-            }
-        };
-        if self.ledger().dirty.contains(path) {
-            let _ = fs::remove_file(&tmp);
-            return Ok(());
-        }
-        fs::rename(&tmp, &abs)?;
-        let observed = self
-            .sdk
-            .stat(&path.as_file())
-            .await
-            .ok()
-            .map(|info| Observation::of(&info));
-        {
-            let mut ledger = self.ledger();
-            match observed {
-                Some(obs) => ledger.observe(path, obs),
-                None => ledger.unobserve(path),
-            }
-            ledger.dirty_clear(path);
-        }
-        log::info!("cached {path} ({size} bytes)");
-        Ok(())
     }
 
     pub fn prune(&self, cache_root: &Path) -> io::Result<()> {
@@ -583,103 +286,32 @@ impl<T: LocalTree> Engine<T> {
     pub fn ledger(&self) -> MutexGuard<'_, Ledger> {
         self.ledger.lock().unwrap()
     }
+}
 
-    async fn conflict_target(&self, path: &RelPath) -> RelPath {
-        let (stem, ext) = match path.name().rsplit_once('.') {
-            Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
-            _ => (path.name().to_string(), String::new()),
-        };
-        let dir = path.parent_or_root();
-        for n in 0..10 {
-            let name = match n {
-                0 => format!("{stem} (conflicted copy){ext}"),
-                n => format!("{stem} (conflicted copy {}){ext}", n + 1),
-            };
-            let candidate = dir.join(&name);
-            if self.sdk.stat(&candidate.as_file()).await.is_err()
-                && !self.tree.backing(&candidate).exists()
-            {
-                return candidate;
-            }
-        }
-        dir.join(&format!("{stem} (conflicted copy){ext}"))
+pub fn io_err(err: SdkError) -> io::Error {
+    match err {
+        SdkError::NotFound => io::ErrorKind::NotFound.into(),
+        SdkError::PermissionDenied => io::ErrorKind::PermissionDenied.into(),
+        err => io::Error::other(err),
     }
+}
 
-    pub(crate) async fn upload(&self, path: &RelPath) -> io::Result<Upload> {
-        if !self.ledger().dirty.contains(path) {
-            return Ok(Upload::Done);
+fn prune_dir(dir: &Path, keep: &[PathBuf]) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if keep.iter().any(|k| k == &path) {
+            continue;
         }
-        if self.ignore.matches(path) {
-            log::debug!("{path} is ignored");
-            return Ok(Upload::Done);
-        }
-        let abs = self.tree.backing(path);
-        let md = match fs::metadata(&abs) {
-            Ok(md) => md,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                self.ledger().dirty_clear(path);
-                return Ok(Upload::Done);
+        if entry.file_type()?.is_dir() {
+            if keep.iter().any(|k| k.starts_with(&path)) {
+                prune_dir(&path, keep)?;
+            } else {
+                fs::remove_dir_all(&path)?;
             }
-            Err(err) => return Err(err),
-        };
-        let before = md.modified().ok();
-
-        let recorded = self.ledger().observations.get(path).copied();
-        let server = self
-            .sdk
-            .stat(&path.as_file())
-            .await
-            .ok()
-            .map(|i| Observation::of(&i));
-        let target = match (recorded, server) {
-            (Some(rec), Some(now)) if rec != now => self.conflict_target(path).await,
-            (None, Some(_)) => self.conflict_target(path).await,
-            _ => path.clone(),
-        };
-        if target != *path {
-            log::warn!("conflict on {path}: uploading as {target}");
+        } else {
+            fs::remove_file(&path)?;
         }
-
-        if !self.ledger().dirty.contains(path) {
-            return Ok(Upload::Done);
-        }
-        save_with_parents(&self.sdk, &target, &abs).await?;
-        let uploaded = self
-            .sdk
-            .stat(&target.as_file())
-            .await
-            .ok()
-            .map(|info| Observation::of(&info));
-
-        if target == *path {
-            if let Some(rec) = uploaded {
-                self.ledger().observe(path, rec);
-            }
-        }
-
-        {
-            let mut ledger = self.ledger();
-            ledger.dirty_clear(path);
-            ledger.dirty_clear(&target);
-        }
-        let after = fs::metadata(&abs).ok().and_then(|md| md.modified().ok());
-        if after != before {
-            self.ledger().dirty_set(path);
-            return Ok(Upload::Retry);
-        }
-
-        if target != *path {
-            if let Err(err) = self.tree.relocate(path, &target) {
-                log::warn!("move conflicted copy {path} -> {target}: {err}");
-            }
-            let mut ledger = self.ledger();
-            ledger.unobserve(path);
-            if let Some(rec) = uploaded {
-                ledger.observe(&target, rec);
-            }
-        }
-        self.tree.settled(&target, after);
-        log::info!("uploaded {target} ({} bytes)", md.len());
-        Ok(Upload::Done)
     }
+    Ok(())
 }

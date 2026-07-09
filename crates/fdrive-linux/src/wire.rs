@@ -200,7 +200,7 @@ impl Filesystem for MountFs {
             let result = if flags.0 & libc::O_TRUNC != 0 {
                 wire.adapter.truncate(&path, 0)
             } else {
-                wire.adapter.hydrate(&path)
+                wire.adapter.hydrate_start(&path)
             };
             match result {
                 Ok(()) => reply.opened(FileHandle(0), FopenFlags::empty()),
