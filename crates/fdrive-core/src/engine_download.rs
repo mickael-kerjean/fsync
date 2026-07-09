@@ -10,6 +10,8 @@ use tokio::sync::watch;
 use crate::path::RelPath;
 use crate::port::LocalTree;
 
+use crate::sdk::Error as SdkError;
+
 use super::{io_err, Engine, Observation};
 
 fn part_file(abs: &Path) -> PathBuf {
@@ -126,11 +128,18 @@ impl<T: LocalTree> Engine<T> {
         if dirty {
             return Ok(());
         }
+        let abs = self.tree.backing(path);
         let current = match self.sdk.stat(&path.as_file()).await {
             Ok(info) => Observation::of(&info),
+            Err(err @ (SdkError::NotFound | SdkError::PermissionDenied)) => {
+                return Err(io_err(err))
+            }
+            Err(err) if abs.is_file() => {
+                log::debug!("hydrate {path} unreachable, serving the cache: {err}");
+                return Ok(());
+            }
             Err(err) => return Err(io_err(err)),
         };
-        let abs = self.tree.backing(path);
         if observed == Some(current) && abs.is_file() {
             return Ok(());
         }

@@ -789,3 +789,22 @@ async fn the_scheduler_uploads_concurrently() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_cached_file_opens_when_the_server_is_unreachable() {
+    let sdk = Sdk::new("http://127.0.0.1:9").unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::spawn(Arc::new(sdk), rt, TempTree::new());
+    let path = RelPath::new("f");
+    engine.tree().write("f", b"cached");
+    engine
+        .ledger()
+        .observe(&path, Observation::new(6, None));
+
+    engine.hydrate(&path).await.unwrap();
+    assert_eq!(engine.tree().read("f").unwrap(), b"cached");
+    assert!(
+        engine.hydrate(&RelPath::new("never-cached")).await.is_err(),
+        "a file we never saw still fails honestly"
+    );
+}
