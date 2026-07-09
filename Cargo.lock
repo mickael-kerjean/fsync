@@ -961,12 +961,8 @@ version = "0.1.0"
 dependencies = [
  "fsync-core",
  "futures-util",
- "httpmock",
- "log",
- "serde_json",
- "thiserror 2.0.18",
+ "libc",
  "tokio",
- "uniffi",
 ]
 
 [[package]]

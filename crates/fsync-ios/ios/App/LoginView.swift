@@ -4,56 +4,73 @@ struct LoginView: View {
     @EnvironmentObject var state: AppState
     @State private var url: String
     @State private var server: String?
+    @FocusState private var fieldFocused: Bool
 
     init() {
         _url = State(initialValue: SessionStore.lastKnown()?.serverUrl ?? "")
     }
 
     var body: some View {
-        if let server {
-            LoginWebView(base: server) { token in
-                Task { await state.connect(server: server, token: token) }
-            }
-            .ignoresSafeArea(edges: .bottom)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Back") { self.server = nil }
+        NavigationStack {
+            if let server {
+                LoginWebView(base: server) { token in
+                    Task { await state.connect(server: server, token: token) }
                 }
+                .ignoresSafeArea(edges: .bottom)
+                .navigationTitle("Sign In")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Cancel") { self.server = nil }
+                    }
+                }
+            } else {
+                connectForm
             }
-        } else {
-            VStack(spacing: 12) {
-                Spacer()
-                Text("Filestash")
-                    .font(.largeTitle.weight(.semibold))
-                    .foregroundStyle(.white)
-                Text("Connect to your server")
-                    .font(.subheadline)
-                    .foregroundStyle(Color.fsMuted)
-                TextField("https://demo.filestash.app", text: $url)
+        }
+        .tint(.fsAccent)
+    }
+
+    private var connectForm: some View {
+        VStack(spacing: 18) {
+            Text("Filestash")
+                .font(.largeTitle.bold())
+
+            HStack(spacing: 10) {
+                Image(systemName: "globe")
+                    .foregroundStyle(.secondary)
+                TextField("demo.filestash.app", text: $url)
+                    .textContentType(.URL)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .padding(14)
-                    .background(Color.white.opacity(0.06))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(.white)
-                Button {
-                    let base = url.contains("://") ? url : "https://\(url)"
-                    server = base.hasSuffix("/") ? String(base.dropLast()) : base
-                } label: {
-                    Text("Connect")
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .foregroundStyle(Color.fsBackground)
-                }
-                .background(Color.fsPrimary)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .disabled(url.isEmpty)
-                .opacity(url.isEmpty ? 0.4 : 1)
-                Spacer()
-                Spacer()
+                    .submitLabel(.go)
+                    .focused($fieldFocused)
+                    .onSubmit(connect)
             }
-            .padding(24)
-            .background(Color.fsBackground.ignoresSafeArea())
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(Color(.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Button(action: connect) {
+                Text("Connect")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(url.isEmpty)
         }
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
+    }
+
+    private func connect() {
+        guard !url.isEmpty else { return }
+        fieldFocused = false
+        let base = url.contains("://") ? url : "https://\(url)"
+        server = base.hasSuffix("/") ? String(base.dropLast()) : base
     }
 }

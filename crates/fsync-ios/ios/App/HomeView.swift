@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct HomeView: View {
@@ -6,37 +7,49 @@ struct HomeView: View {
     @State private var checkNow = 0
 
     var body: some View {
-        VStack {
-            Spacer()
-            StatusCircle(connected: connected) { checkNow += 1 }
-            Text(label)
-                .font(.headline)
-                .foregroundStyle(.white)
-                .padding(.top, 16)
-            if let account {
-                Text(account)
-                    .font(.caption)
-                    .foregroundStyle(Color.fsMuted)
-                    .padding(.top, 2)
+        NavigationStack {
+            VStack(spacing: 0) {
+                Spacer()
+
+                StatusCircle(connected: connected) { checkNow += 1 }
+
+                Text(label)
+                    .font(.title3.weight(.semibold))
+                    .padding(.top, 20)
+
+                if !host.isEmpty {
+                    Text(host)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
+
+                Spacer()
+
+                Button {
+                    Task { await DomainManager.open() }
+                } label: {
+                    Text("Browse")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
             }
-            Spacer()
-            Button {
-                Task { await DomainManager.open() }
-            } label: {
-                Text("Open in Files")
-                    .frame(maxWidth: .infinity, minHeight: 44)
-                    .foregroundStyle(Color.fsEmphasisText)
+            .padding(24)
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(role: .destructive) {
+                        Task { await state.logout() }
+                    } label: {
+                        Image(systemName: "rectangle.portrait.and.arrow.right")
+                    }
+                    .accessibilityLabel("Log Out")
+                }
             }
-            .background(Color.fsEmphasis)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            Button("Log out") {
-                Task { await state.logout() }
-            }
-            .foregroundStyle(Color.fsMuted)
-            .padding(.top, 8)
         }
-        .padding(24)
-        .background(Color.fsBackground.ignoresSafeArea())
+        .tint(.fsAccent)
         .task(id: checkNow) {
             guard let session = state.session else { return }
             while !Task.isCancelled {
@@ -49,6 +62,11 @@ struct HomeView: View {
         }
     }
 
+    private var host: String {
+        guard let session = state.session else { return "" }
+        return URL(string: session.serverUrl)?.host ?? session.serverUrl
+    }
+
     private var label: String {
         switch connected {
         case .some(true): return "Connected"
@@ -56,37 +74,55 @@ struct HomeView: View {
         case .none: return "Connecting…"
         }
     }
-
-    private var account: String? {
-        guard let session = state.session else { return nil }
-        let host = URL(string: session.serverUrl)?.host ?? session.serverUrl
-        return session.user.isEmpty ? host : "\(session.user) @ \(host)/\(session.storage)"
-    }
 }
 
+/// Large centered connection indicator — green when reachable, red when not.
+/// Tapping it re-checks. When connected, the rings and a soft halo breathe
+/// (driven per-frame by TimelineView) so the screen reads as live, not frozen.
 private struct StatusCircle: View {
     let connected: Bool?
     let onTap: () -> Void
 
     private var fill: Color {
         switch connected {
-        case .some(true): return .fsSuccess
-        case .some(false): return .fsError
-        case .none: return Color.white.opacity(0.12)
+        case .some(true): return .fsConnected
+        case .some(false): return .fsOffline
+        case .none: return Color(.systemGray4)
         }
+    }
+
+    private var glyph: Color {
+        connected == nil ? Color(.systemGray) : .fsGlyph
     }
 
     var body: some View {
         Button(action: onTap) {
-            ZStack {
-                Circle().fill(fill.opacity(0.14)).frame(width: 168, height: 168)
-                Circle().fill(fill.opacity(0.22)).frame(width: 146, height: 146)
-                Circle().fill(fill).frame(width: 124, height: 124)
-                Image(systemName: "power")
-                    .font(.system(size: 44, weight: .semibold))
-                    .foregroundStyle(connected == nil ? Color.fsMuted : Color.fsBackground)
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: connected != true)) { timeline in
+                let g = glow(at: timeline.date)
+                ZStack {
+                    Circle()
+                        .fill(fill.opacity(0.14 + 0.12 * g))
+                        .frame(width: 168, height: 168)
+                    Circle()
+                        .fill(fill.opacity(0.22 + 0.14 * g))
+                        .frame(width: 146, height: 146)
+                    Circle()
+                        .fill(fill)
+                        .frame(width: 124, height: 124)
+                        .shadow(color: fill.opacity(0.7 * g), radius: 12 + 20 * g)
+                    Image(systemName: "power")
+                        .font(.system(size: 44, weight: .semibold))
+                        .foregroundStyle(glyph)
+                }
             }
         }
         .buttonStyle(.plain)
+    }
+
+    /// 0…1 breathing value; a sine over a 1.8s period. Flat when not connected.
+    private func glow(at date: Date) -> Double {
+        guard connected == true else { return 0 }
+        let t = date.timeIntervalSinceReferenceDate
+        return (sin(t * 2 * .pi / 1.8) + 1) / 2
     }
 }

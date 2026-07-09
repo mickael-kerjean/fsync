@@ -4,16 +4,12 @@ import WebKit
 @MainActor
 final class AppState: ObservableObject {
     @Published var session: Session? = SessionStore.load()
-    @Published var error: String?
 
     func connect(server: String, token: String) async {
         let session = Session(serverUrl: server, user: "", storage: "", insecure: false, token: token)
         SessionStore.save(session)
-        do {
-            try await DomainManager.addDomain(for: session)
-        } catch {
-            self.error = error.localizedDescription
-        }
+        // Domain registration is best-effort; the session stands on its own.
+        try? await DomainManager.addDomain(for: session)
         self.session = session
     }
 

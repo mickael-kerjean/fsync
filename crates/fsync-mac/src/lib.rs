@@ -1,354 +1,260 @@
-//! The macOS adapter: like windows, the system owns the user's replica
-//! (FileProvider materializes and dehydrates files on its own); the only
-//! local state this crate keeps is a spool of unpushed edits. Content
-//! travels down through fetch (streamed straight to the URL the system
-//! consumes) and up through created/modified, which copy the system's
-//! temp file into the spool and hand the debt to the engine's scheduler.
-//! Deletes and renames are verdicts: the server call happens first and a
-//! failure vetoes the operation in Finder.
+#![allow(clippy::missing_safety_doc)]
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
-use fsync_core::engine::{io_err, Engine};
-use fsync_core::port::LocalTree;
-use fsync_core::path::RelPath;
-use fsync_core::scheduler::UploadStatus;
-use fsync_core::sdk::{self, Sdk};
+use fsync_core::byte_stream;
+use fsync_core::sdk::{FileInfo, FileType, Sdk};
 use futures_util::TryStreamExt;
 use tokio::runtime::Runtime;
 
-uniffi::setup_scaffolding!();
-
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum FsError {
-    #[error("invalid credentials")]
-    InvalidCredentials,
-    #[error("not authenticated")]
-    NotAuthenticated,
-    #[error("permission denied")]
-    PermissionDenied,
-    #[error("not found")]
-    NotFound,
-    #[error("network error: {msg}")]
-    Network { msg: String },
-    #[error("{msg}")]
-    Other { msg: String },
-}
-
-impl From<sdk::Error> for FsError {
-    fn from(err: sdk::Error) -> Self {
-        match err {
-            sdk::Error::InvalidCredentials => Self::InvalidCredentials,
-            sdk::Error::NotAuthenticated => Self::NotAuthenticated,
-            sdk::Error::PermissionDenied => Self::PermissionDenied,
-            sdk::Error::NotFound => Self::NotFound,
-            sdk::Error::Http(err) => Self::Network {
-                msg: err.to_string(),
-            },
-            err => Self::Other {
-                msg: err.to_string(),
-            },
-        }
-    }
-}
-
-impl From<io::Error> for FsError {
-    fn from(err: io::Error) -> Self {
-        match err.kind() {
-            io::ErrorKind::NotFound => Self::NotFound,
-            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
-            _ => Self::Other {
-                msg: err.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum EntryKind {
-    File,
-    Directory,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum SyncState {
-    Idle,
-    Busy,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct Entry {
-    pub name: String,
-    pub kind: EntryKind,
-    pub size: Option<u64>,
-    pub mtime_ms: Option<i64>,
-}
-
-impl From<sdk::FileInfo> for Entry {
-    fn from(info: sdk::FileInfo) -> Self {
-        Self {
-            name: info.name,
-            kind: match info.kind {
-                sdk::FileType::File => EntryKind::File,
-                sdk::FileType::Directory => EntryKind::Directory,
-            },
-            size: info.size,
-            mtime_ms: info
-                .mtime
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64),
-        }
-    }
-}
-
-#[uniffi::export]
-pub fn login(
-    url: String,
-    insecure: bool,
-    user: String,
-    password: String,
-    storage: String,
-) -> Result<String, FsError> {
-    let rt = runtime()?;
-    let sdk = rt.block_on(
-        Sdk::builder(&url)
-            .insecure(insecure)
-            .login(&user, &password, &storage),
-    )?;
-    Ok(sdk.token().unwrap_or_default().to_string())
-}
-
-#[uniffi::export]
-pub fn end_session(url: String, insecure: bool, token: String) {
-    let Ok(rt) = runtime() else { return };
-    let Ok(sdk) = Sdk::builder(&url).insecure(insecure).token(token) else {
-        return;
-    };
-    let _ = rt.block_on(sdk.logout());
-}
-
-#[uniffi::export]
-pub fn ping(url: String, insecure: bool, token: String) -> bool {
-    let Ok(rt) = runtime() else { return false };
-    let Ok(sdk) = Sdk::builder(&url).insecure(insecure).token(token) else {
-        return false;
-    };
-    rt.block_on(sdk.ls("/")).is_ok()
-}
-
-struct SpoolTree {
-    spool_dir: PathBuf,
-    ledger: PathBuf,
-}
-
-impl LocalTree for SpoolTree {
-    fn backing(&self, path: &RelPath) -> PathBuf {
-        self.spool_dir.join(path.as_str())
-    }
-
-    fn relocate(&self, from: &RelPath, to: &RelPath) -> io::Result<()> {
-        let to_abs = self.backing(to);
-        if let Some(parent) = to_abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::rename(self.backing(from), to_abs)
-    }
-
-    fn settled(&self, target: &RelPath, _mtime: Option<std::time::SystemTime>) {
-        let _ = fs::remove_file(self.backing(target));
-    }
-
-    fn ledger(&self) -> PathBuf {
-        self.ledger.clone()
-    }
-}
-
-fn rel(document_id: &str) -> RelPath {
-    RelPath::new(document_id)
-}
-
-#[derive(uniffi::Object)]
-pub struct Adapter {
+pub struct Handle {
     rt: Runtime,
-    engine: Arc<Engine<SpoolTree>>,
+    sdk: Sdk,
+    cache: Mutex<HashMap<String, (bool, u64, i64)>>,
+    writers: Mutex<HashMap<String, Vec<u8>>>,
 }
 
-#[uniffi::export]
-impl Adapter {
-    #[uniffi::constructor]
-    pub fn new(
-        url: String,
-        insecure: bool,
-        token: String,
-        data_dir: String,
-    ) -> Result<Arc<Self>, FsError> {
-        let sdk = Sdk::builder(&url).insecure(insecure).token(token)?;
-        let rt = runtime()?;
-        let data = PathBuf::from(data_dir);
-        let spool_dir = data.join("spool");
-        fs::create_dir_all(&spool_dir)?;
-        let tree = SpoolTree {
-            ledger: data.join("fsync.json"),
-            spool_dir: spool_dir.clone(),
-        };
-        let engine = Engine::spawn(Arc::new(sdk), rt.handle().clone(), tree);
-        engine.prune(&spool_dir)?;
-        engine.recover();
-        Ok(Arc::new(Self { rt, engine }))
-    }
+fn cstr(ptr: *const c_char) -> String {
+    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+}
 
-    pub fn ls(&self, path: String) -> Result<Vec<Entry>, FsError> {
-        let dir = rel(&path);
-        let listing = self.rt.block_on(self.engine.sdk().ls(&dir.as_dir()))?;
-        Ok(self
-            .engine
-            .overlay(&dir, listing)
-            .into_iter()
-            .map(Entry::from)
-            .collect())
-    }
+fn mtime_secs(t: Option<std::time::SystemTime>) -> i64 {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
-    pub fn stat(&self, path: String) -> Result<Entry, FsError> {
-        let rel = rel(&path);
-        if let Some(md) = self.engine.dirty_metadata(&rel) {
-            return Ok(Entry {
-                name: rel.name().to_string(),
-                kind: EntryKind::File,
-                size: Some(md.len()),
-                mtime_ms: md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64),
-            });
+fn dir_for_ls(path: &str) -> String {
+    if path == "/" {
+        "/".into()
+    } else {
+        format!("{}/", path.trim_end_matches('/'))
+    }
+}
+
+fn parent_of(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    match p.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(i) => format!("{}/", &p[..i]),
+    }
+}
+
+fn join_child(dir: &str, name: &str) -> String {
+    format!("{}/{name}", dir.trim_end_matches('/'))
+}
+
+impl Handle {
+    fn list_and_cache(&self, dir: &str) -> Result<Vec<FileInfo>, ()> {
+        let entries = self.rt.block_on(self.sdk.ls(&dir_for_ls(dir))).map_err(|_| ())?;
+        let mut cache = self.cache.lock().unwrap();
+        for e in &entries {
+            cache.insert(
+                join_child(dir, &e.name),
+                (e.kind == FileType::Directory, e.size.unwrap_or(0), mtime_secs(e.mtime)),
+            );
         }
-        Ok(self
-            .rt
-            .block_on(self.engine.sdk().stat(&rel.as_file()))?
-            .into())
+        Ok(entries)
     }
 
-    pub fn fetch(&self, path: String, dest_path: String) -> Result<(), FsError> {
-        let rel = rel(&path);
-        if self.engine.dirty_metadata(&rel).is_some() {
-            fs::copy(self.engine.tree().backing(&rel), &dest_path)?;
-            return Ok(());
-        }
+    fn fetch_all(&self, path: &str) -> Result<Vec<u8>, ()> {
         self.rt.block_on(async {
-            let mut stream = self.engine.sdk().cat(&rel.as_file()).await.map_err(io_err)?;
-            let mut file = fs::File::create(&dest_path)?;
-            while let Some(chunk) = stream.try_next().await? {
-                file.write_all(&chunk)?;
+            let mut stream = self.sdk.cat(path).await.map_err(|_| ())?;
+            let mut out = Vec::new();
+            while let Some(chunk) = stream.try_next().await.map_err(|_| ())? {
+                out.extend_from_slice(&chunk);
             }
-            file.flush()?;
-            Ok::<(), io::Error>(())
-        })?;
-        Ok(())
+            Ok(out)
+        })
     }
 
-    pub fn created(&self, path: String, contents_path: Option<String>) -> Result<(), FsError> {
-        let rel = rel(&path);
-        let abs = self.engine.tree().backing(&rel);
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match contents_path {
-            Some(src) => {
-                fs::copy(&src, &abs)?;
-            }
-            None => {
-                fs::File::create(&abs)?;
-            }
-        }
-        self.engine.created(&rel);
-        self.engine.released(&rel);
-        Ok(())
+    fn invalidate(&self) {
+        self.cache.lock().unwrap().clear();
     }
 
-    pub fn modified(&self, path: String, contents_path: String) -> Result<(), FsError> {
-        let rel = rel(&path);
-        self.rt.block_on(self.engine.overwriting(&rel));
-        let abs = self.engine.tree().backing(&rel);
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&contents_path, &abs)?;
-        self.engine.modified(&rel);
-        self.engine.released(&rel);
-        Ok(())
-    }
-
-    pub fn mkdir(&self, path: String) -> Result<(), FsError> {
-        let rel = rel(&path);
-        self.rt
-            .block_on(self.engine.sdk().mkdir(&rel.as_dir()))
-            .map_err(FsError::from)
-    }
-
-    pub fn delete(&self, path: String) -> Result<(), FsError> {
-        let is_dir = path.ends_with('/');
-        let rel = rel(&path);
-        self.rt.block_on(self.engine.delete(&rel, is_dir))?;
-        let abs = self.engine.tree().backing(&rel);
-        let _ = if is_dir {
-            fs::remove_dir_all(&abs)
-        } else {
-            fs::remove_file(&abs)
-        };
-        Ok(())
-    }
-
-    pub fn rename(&self, from: String, to: String) -> Result<(), FsError> {
-        let is_dir = from.ends_with('/');
-        let (from, to) = (rel(&from), rel(&to));
-        self.rt.block_on(self.engine.rename(&from, &to, is_dir))?;
-        let from_abs = self.engine.tree().backing(&from);
-        if from_abs.exists() {
-            let _ = self.engine.tree().relocate(&from, &to);
-        }
-        Ok(())
-    }
-
-    pub fn thumbnail(&self, path: String) -> Result<Vec<u8>, FsError> {
-        let rel = rel(&path);
-        Ok(self
-            .rt
-            .block_on(self.engine.sdk().thumbnail(&rel.as_file()))?)
-    }
-
-    pub fn recover(&self) {
-        self.engine.recover();
-    }
-
-    pub fn state(&self) -> SyncState {
-        match *self.engine.upload_status().borrow() {
-            UploadStatus::Idle => SyncState::Idle,
-            UploadStatus::Busy => SyncState::Busy,
-            UploadStatus::Error => SyncState::Error,
-        }
-    }
-
-    pub fn flush(&self, timeout_ms: u64) {
-        self.rt
-            .block_on(self.engine.flush(Duration::from_millis(timeout_ms)));
-    }
-
-    pub fn vacuum(&self) -> Result<(), FsError> {
-        self.engine
-            .prune(&self.engine.tree().spool_dir)
-            .map_err(FsError::from)
+    fn is_cached_dir(&self, path: &str) -> bool {
+        self.cache.lock().unwrap().get(path).is_some_and(|&(d, ..)| d)
     }
 }
 
-fn runtime() -> Result<Runtime, FsError> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| FsError::Other { msg: e.to_string() })
+fn commit<E>(h: &Handle, r: Result<(), E>) -> c_int {
+    match r {
+        Ok(()) => {
+            h.invalidate();
+            0
+        }
+        Err(_) => -libc::EIO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_connect(url: *const c_char, token: *const c_char, insecure: c_int) -> *mut Handle {
+    let (url, token) = (cstr(url), cstr(token));
+    let Ok(rt) = Runtime::new() else { return std::ptr::null_mut() };
+    let Ok(sdk) = Sdk::builder(&url).insecure(insecure != 0).token(token) else {
+        return std::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(Handle {
+        rt,
+        sdk,
+        cache: Mutex::new(HashMap::new()),
+        writers: Mutex::new(HashMap::new()),
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_getattr(
+    h: *mut Handle,
+    path: *const c_char,
+    size_out: *mut u64,
+    is_dir_out: *mut c_int,
+    mtime_out: *mut i64,
+) -> c_int {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    let set = |d: bool, s: u64, m: i64| unsafe {
+        *size_out = s;
+        *is_dir_out = i32::from(d);
+        *mtime_out = m;
+    };
+    if let Some(buf) = h.writers.lock().unwrap().get(&path) {
+        set(false, buf.len() as u64, 0);
+        return 0;
+    }
+    if path == "/" {
+        set(true, 0, 0);
+        return 0;
+    }
+    if let Some(&(d, s, m)) = h.cache.lock().unwrap().get(&path) {
+        set(d, s, m);
+        return 0;
+    }
+    if h.list_and_cache(&parent_of(&path)).is_ok() {
+        if let Some(&(d, s, m)) = h.cache.lock().unwrap().get(&path) {
+            set(d, s, m);
+            return 0;
+        }
+    }
+    -libc::ENOENT
+}
+
+pub type FillCb =
+    extern "C" fn(ctx: *mut c_void, name: *const c_char, is_dir: c_int, size: u64, mtime: i64);
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_readdir(h: *mut Handle, path: *const c_char, fill: FillCb, ctx: *mut c_void) -> c_int {
+    let h = unsafe { &*h };
+    match h.list_and_cache(&cstr(path)) {
+        Ok(entries) => {
+            for e in entries {
+                let Ok(name) = CString::new(e.name) else { continue };
+                let is_dir = i32::from(e.kind == FileType::Directory);
+                fill(ctx, name.as_ptr(), is_dir, e.size.unwrap_or(0), mtime_secs(e.mtime));
+            }
+            0
+        }
+        Err(_) => -libc::EIO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_read(
+    h: *mut Handle,
+    path: *const c_char,
+    buf: *mut c_char,
+    size: usize,
+    offset: i64,
+) -> isize {
+    let h = unsafe { &*h };
+    let Ok(data) = h.fetch_all(&cstr(path)) else { return -libc::EIO as isize };
+    let off = offset.max(0) as usize;
+    if off >= data.len() {
+        return 0;
+    }
+    let end = (off + size).min(data.len());
+    unsafe { std::ptr::copy_nonoverlapping(data[off..end].as_ptr(), buf as *mut u8, end - off) };
+    (end - off) as isize
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_create(h: *mut Handle, path: *const c_char) -> c_int {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    h.writers.lock().unwrap().insert(path.clone(), Vec::new());
+    commit(h, h.rt.block_on(h.sdk.save(&path, byte_stream(Vec::<u8>::new()))))
+}
+
+fn writer_buf<'a>(h: &Handle, writers: &'a mut HashMap<String, Vec<u8>>, path: &str) -> &'a mut Vec<u8> {
+    writers
+        .entry(path.to_string())
+        .or_insert_with(|| h.fetch_all(path).unwrap_or_default())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_write(
+    h: *mut Handle,
+    path: *const c_char,
+    buf: *const c_char,
+    size: usize,
+    offset: i64,
+) -> isize {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    let off = offset.max(0) as usize;
+    let src = unsafe { std::slice::from_raw_parts(buf as *const u8, size) };
+    let mut writers = h.writers.lock().unwrap();
+    let b = writer_buf(h, &mut writers, &path);
+    if off + size > b.len() {
+        b.resize(off + size, 0);
+    }
+    b[off..off + size].copy_from_slice(src);
+    size as isize
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_truncate(h: *mut Handle, path: *const c_char, size: i64) -> c_int {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    let mut writers = h.writers.lock().unwrap();
+    writer_buf(h, &mut writers, &path).resize(size.max(0) as usize, 0);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_release(h: *mut Handle, path: *const c_char) -> c_int {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    let Some(data) = h.writers.lock().unwrap().remove(&path) else {
+        return 0;
+    };
+    commit(h, h.rt.block_on(h.sdk.save(&path, byte_stream(data))))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_mkdir(h: *mut Handle, path: *const c_char) -> c_int {
+    let h = unsafe { &*h };
+    commit(h, h.rt.block_on(h.sdk.mkdir(&dir_for_ls(&cstr(path)))))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_rm(h: *mut Handle, path: *const c_char, is_dir: c_int) -> c_int {
+    let h = unsafe { &*h };
+    let path = cstr(path);
+    let target = if is_dir != 0 { dir_for_ls(&path) } else { path };
+    commit(h, h.rt.block_on(h.sdk.rm(&target)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fsx_rename(h: *mut Handle, from: *const c_char, to: *const c_char) -> c_int {
+    let h = unsafe { &*h };
+    let (from, to) = (cstr(from), cstr(to));
+    let (f, t) = if h.is_cached_dir(&from) {
+        (dir_for_ls(&from), dir_for_ls(&to))
+    } else {
+        (from, to)
+    };
+    commit(h, h.rt.block_on(h.sdk.mv(&f, &t)))
 }

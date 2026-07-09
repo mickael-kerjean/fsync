@@ -10,12 +10,11 @@ struct Session {
 }
 
 enum SessionStore {
-    static let appGroup = "group.app.filestash.sync"
     private static let service = "app.filestash.sync"
     private static let tokenAccount = "session-token"
 
     static func save(_ session: Session) {
-        guard let defaults = UserDefaults(suiteName: appGroup) else { return }
+        let defaults = UserDefaults.standard
         defaults.set(session.serverUrl, forKey: "serverUrl")
         defaults.set(session.user, forKey: "user")
         defaults.set(session.storage, forKey: "storage")
@@ -31,8 +30,8 @@ enum SessionStore {
     }
 
     static func lastKnown() -> Session? {
-        guard let defaults = UserDefaults(suiteName: appGroup),
-              let serverUrl = defaults.string(forKey: "serverUrl"),
+        let defaults = UserDefaults.standard
+        guard let serverUrl = defaults.string(forKey: "serverUrl"),
               let user = defaults.string(forKey: "user"),
               let storage = defaults.string(forKey: "storage")
         else { return nil }

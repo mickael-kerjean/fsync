@@ -25,9 +25,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -40,7 +40,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -67,52 +69,89 @@ fun HomeScreen(onLoggedOut: () -> Unit) {
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Spacer(modifier = Modifier.weight(1f))
-        StatusCircle(connected) { checkNow++ }
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            when (connected) {
-                true -> "Connected"
-                false -> "Offline"
-                null -> "Connecting…"
-            },
-            style = MaterialTheme.typography.titleMedium,
-        )
-        account?.let {
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
-        }
-        Spacer(modifier = Modifier.weight(1f))
-        Button(
-            onClick = { openFileManager(context) },
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.secondary,
-                contentColor = MaterialTheme.colorScheme.onSecondary,
-            ),
-            shape = MaterialTheme.shapes.extraSmall,
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp),
+                .fillMaxSize()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("Browse")
+            Spacer(modifier = Modifier.weight(1f))
+            StatusCircle(connected) { checkNow++ }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                when (connected) {
+                    true -> "Connected"
+                    false -> "Offline"
+                    null -> "Connecting…"
+                },
+                style = MaterialTheme.typography.titleMedium,
+            )
+            account?.let {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            Button(
+                onClick = { openFileManager(context) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary,
+                ),
+                shape = MaterialTheme.shapes.extraSmall,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+            ) {
+                Text("Browse")
+            }
         }
-        TextButton(
+        IconButton(
             onClick = {
                 CoroutineScope(Dispatchers.IO).launch { Native.logout(context) }
                 onLoggedOut()
             },
-            colors = ButtonDefaults.textButtonColors(
-                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            ),
+            modifier = Modifier.align(Alignment.TopEnd),
         ) {
-            Text("Log out")
+            LogoutIcon(MaterialTheme.colorScheme.onSurfaceVariant)
         }
+    }
+}
+
+@Composable
+private fun LogoutIcon(tint: Color) {
+    Canvas(modifier = Modifier.size(22.dp)) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = w / 11f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        // Door frame, open on the right.
+        drawPath(
+            Path().apply {
+                moveTo(w * 0.52f, h * 0.15f)
+                lineTo(w * 0.17f, h * 0.15f)
+                lineTo(w * 0.17f, h * 0.85f)
+                lineTo(w * 0.52f, h * 0.85f)
+            },
+            color = tint,
+            style = stroke,
+        )
+        // Arrow leaving through the opening.
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.40f, h * 0.5f),
+            end = Offset(w * 0.88f, h * 0.5f),
+            strokeWidth = stroke.width,
+            cap = StrokeCap.Round,
+        )
+        drawPath(
+            Path().apply {
+                moveTo(w * 0.70f, h * 0.31f)
+                lineTo(w * 0.90f, h * 0.5f)
+                lineTo(w * 0.70f, h * 0.69f)
+            },
+            color = tint,
+            style = stroke,
+        )
     }
 }
 

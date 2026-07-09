@@ -7,7 +7,6 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
 targets:
   Filestash:
     type: application
@@ -15,56 +14,11 @@ targets:
     sources:
       - App
       - Shared
-      - Generated
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.filestash.mac
-    dependencies:
-      - target: FilestashFileProvider
-      - framework: Fsync.xcframework
-        embed: false
     info:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Filestash
         LSUIElement: true
-        NSFileProviderDomainUsageDescription: Show your Filestash files in Finder.
-    entitlements:
-      path: App/Filestash.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        com.apple.security.application-groups:
-          - group.app.filestash.sync
-        keychain-access-groups:
-          - $(AppIdentifierPrefix)app.filestash.sync.shared
-  FilestashFileProvider:
-    type: app-extension
-    platform: macOS
-    sources:
-      - FileProvider
-      - Shared
-      - Generated
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.filestash.mac.fileprovider
-    dependencies:
-      - framework: Fsync.xcframework
-        embed: false
-    info:
-      path: FileProvider/Info.plist
-      properties:
-        CFBundleDisplayName: Filestash
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
-          NSExtensionFileProviderReplicatedExtension: true
-    entitlements:
-      path: FileProvider/FilestashFileProvider.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        com.apple.security.application-groups:
-          - group.app.filestash.sync
-        keychain-access-groups:
-          - $(AppIdentifierPrefix)app.filestash.sync.shared

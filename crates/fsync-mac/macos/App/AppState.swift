@@ -3,25 +3,30 @@ import WebKit
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var session: Session? = SessionStore.load()
+    @Published var session: Session?
     @Published var error: String?
+
+    init() {
+        let saved = SessionStore.load()
+        session = saved
+        if let saved {
+            try? MountManager.mount(server: saved.serverUrl, token: saved.token)
+        }
+    }
 
     func connect(server: String, token: String) async {
         let session = Session(serverUrl: server, user: "", storage: "", insecure: false, token: token)
         SessionStore.save(session)
         do {
-            try await DomainManager.addDomain(for: session)
+            try MountManager.mount(server: server, token: token)
+            self.session = session
         } catch {
             self.error = error.localizedDescription
         }
-        self.session = session
     }
 
     func logout() async {
-        if let session {
-            Task.detached { endSession(url: session.serverUrl, insecure: session.insecure, token: session.token) }
-        }
-        try? await DomainManager.removeDomain()
+        MountManager.unmount()
         SessionStore.clear()
         let store = WKWebsiteDataStore.default()
         let types: Set<String> = [WKWebsiteDataTypeCookies]
