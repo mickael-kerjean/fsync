@@ -1,6 +1,6 @@
 # What is fsync?
 
-Filestash Sync brings the Dropbox experience to any storage backend, from S3 and SFTP to NFS, SMB, FTP, SMB, IPFS and beyond.
+A cross platform sync client that does not try to own your storage, but rather connects to it wherever it already lives. From S3 and SFTP to FTP, NFS, SMB, IPFS, Azure, Google Cloud, and beyond, it is powered by <a href="https://github.com/mickael-kerjean/filestash">Filestash</a>
 
 <p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-windows.png" alt="windows screenshot" />
@@ -8,13 +8,13 @@ Filestash Sync brings the Dropbox experience to any storage backend, from S3 and
 </p>
 
 <p align="center">
-    <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-android.png" alt="android screenshot" />
-    <em>Android screenshot</em>
+    <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-apple.png" alt="apple screenshot" />
+    <em>Apple screenshot</em>
 </p>
 
 <p align="center">
-    <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-apple.png" alt="apple screenshot" />
-    <em>Apple screenshot</em>
+    <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-android.png" alt="android screenshot" />
+    <em>Android screenshot</em>
 </p>
 
 <p align="center">
@@ -31,7 +31,7 @@ We use the hexagonal architecture / ports and adapters pattern. The core owns al
 | `fsync-core` | `Engine` (ledger, conflict rules, upload scheduler), the `LocalTree` port, the Filestash HTTP sdk |
 | `fsync-linux` | FUSE, GTK |
 | `fsync-windows` | Win32, CfAPI, ReadDirectoryChangesW, IShellWindows |
-| `fsync-mac` | FileProvider |
+| `fsync-mac` | fuse-t |
 | `fsync-ios` | FileProvider |
 | `fsync-android` | Storage Access Framework (Kotlin wire, UniFFI) |
 
