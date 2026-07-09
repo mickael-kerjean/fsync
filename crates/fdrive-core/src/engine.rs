@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -276,6 +276,7 @@ pub struct Engine<T: LocalTree> {
     unreadable: AtomicBool,
     queue: mpsc::UnboundedSender<Msg>,
     status: watch::Receiver<UploadStatus>,
+    hydrating: Mutex<HashMap<RelPath, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<T: LocalTree> Engine<T> {
@@ -302,6 +303,7 @@ impl<T: LocalTree> Engine<T> {
                 unreadable: AtomicBool::new(unreadable),
                 queue,
                 status,
+                hydrating: Mutex::new(HashMap::new()),
             }
         })
     }
@@ -360,6 +362,17 @@ impl<T: LocalTree> Engine<T> {
     }
 
     pub async fn hydrate(&self, path: &RelPath) -> io::Result<()> {
+        let gate = self.hydrating.lock().unwrap().entry(path.clone()).or_default().clone();
+        let _gate = gate.lock().await;
+        let result = self.fetch(path).await;
+        let mut hydrating = self.hydrating.lock().unwrap();
+        if hydrating.get(path).is_some_and(|e| Arc::strong_count(e) <= 2) {
+            hydrating.remove(path);
+        }
+        result
+    }
+
+    async fn fetch(&self, path: &RelPath) -> io::Result<()> {
         let (observed, dirty) = {
             let ledger = self.ledger();
             (

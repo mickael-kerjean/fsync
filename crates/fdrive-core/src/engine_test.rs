@@ -626,3 +626,33 @@ async fn upload_recreates_missing_parents_and_stays_dirty_on_failure() {
     save.assert_hits(2);
     assert!(engine.ledger().dirty.contains(&path));
 }
+
+#[tokio::test]
+async fn concurrent_hydrates_download_once() {
+    let server = MockServer::start();
+    let mtime = "Wed, 21 Oct 2015 07:28:00 GMT";
+    server.mock(|when, then| {
+        when.method(Method::HEAD)
+            .path("/api/files/cat")
+            .query_param("path", "/f");
+        then.status(200)
+            .header("content-length", "5")
+            .header("last-modified", mtime);
+    });
+    let cat = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/files/cat")
+            .query_param("path", "/f");
+        then.status(200)
+            .body("hello")
+            .delay(std::time::Duration::from_millis(200));
+    });
+    let engine = engine(&server);
+    let path = RelPath::new("f");
+
+    let (a, b) = tokio::join!(engine.hydrate(&path), engine.hydrate(&path));
+    a.unwrap();
+    b.unwrap();
+    cat.assert_hits(1);
+    assert_eq!(engine.tree().read("f").unwrap(), b"hello");
+}
