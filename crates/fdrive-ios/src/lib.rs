@@ -190,7 +190,7 @@ impl Adapter {
         let cache_dir = data.join("cache");
         fs::create_dir_all(&cache_dir)?;
         let tree = IosTree {
-            ledger: data.join("fdrive.json"),
+            ledger: data.join("fdrive.db"),
             cache_dir: cache_dir.clone(),
             meta: Mutex::new(HashMap::new()),
         };

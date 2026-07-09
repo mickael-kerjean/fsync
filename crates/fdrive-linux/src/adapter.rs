@@ -65,7 +65,7 @@ impl Adapter {
         fs::create_dir_all(&cache_dir)?;
         let tree = CacheTree {
             cache_dir,
-            ledger: data_dir.join("fdrive.json"),
+            ledger: data_dir.join("fdrive.db"),
             meta: Mutex::new(HashMap::new()),
         };
         let adapter = Self {

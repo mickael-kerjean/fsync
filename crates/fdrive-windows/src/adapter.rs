@@ -111,7 +111,7 @@ impl Adapter {
         fs::create_dir_all(&root)?;
         let tree = PlaceholderTree {
             root: root.clone(),
-            ledger: data.join("fdrive.json"),
+            ledger: data.join("fdrive.db"),
             rt: rt.clone(),
             suppressed: Mutex::new(BTreeMap::new()),
         };
@@ -159,10 +159,6 @@ impl Adapter {
 
     fn abs(&self, path: &RelPath) -> PathBuf {
         wire::abs_of(&self.root, path)
-    }
-
-    fn save_state(&self) {
-        self.engine.persist();
     }
 
     fn classify(&self, abs: &Path, path: &RelPath) -> io::Result<FileState> {
@@ -258,11 +254,7 @@ impl Adapter {
                 "{path}: short download ({sent} of {size} bytes)"
             )));
         }
-        self.engine
-            .ledger()
-            .observations
-            .insert(path.clone(), Observation::of(&info));
-        self.save_state();
+        self.engine.ledger().observe(path, Observation::of(&info));
         Ok(sent)
     }
 
@@ -402,7 +394,6 @@ impl Adapter {
             }
             self.drop_stale(&child, md.is_dir());
         }
-        self.save_state();
         Ok(())
     }
 
@@ -502,8 +493,7 @@ impl Adapter {
             wire::create_placeholder(&self.root, path, size, mtime)
         });
         if result.is_ok() {
-            self.engine.ledger().observations.remove(path);
-            self.save_state();
+            self.engine.ledger().unobserve(path);
             log::info!("rebuilt placeholder {path} ({size} bytes)");
             if pinned {
                 if let Err(err) = wire::set_pinned(&abs) {
@@ -543,11 +533,9 @@ impl Adapter {
             Ok(()) => {
                 log::info!("dropped {path} (gone remotely)");
                 self.engine.ledger().forget(path);
-                self.save_state();
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 self.engine.ledger().forget(path);
-                self.save_state();
             }
             Err(err) => log::warn!("drop {path}: {err}"),
         }
@@ -616,7 +604,7 @@ impl Adapter {
                     continue;
                 }
                 match self.classify(&abs, &child) {
-                    Ok(FileState::Edited) if self.engine.ledger().dirty.insert(child.clone()) => {
+                    Ok(FileState::Edited) if self.engine.ledger().dirty_set(&child) => {
                         armed.push(child);
                     }
                     Ok(FileState::Cached(Pin::Unpinned)) => match wire::set_hydration(&abs, false) {
@@ -639,7 +627,6 @@ impl Adapter {
             .engine
             .tree()
             .suppress(&root, || self.vacuum_dir(&root));
-        self.save_state();
         result.map(|_| ())
     }
 

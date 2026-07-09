@@ -121,7 +121,7 @@ async fn unreadable_ledger_quarantines_instead_of_pruning() {
 }
 
 fn mark_dirty(engine: &Engine<TempTree>, path: &RelPath) {
-    engine.ledger().dirty.insert(path.clone());
+    engine.ledger().dirty_set(path);
 }
 
 #[test]
@@ -211,11 +211,8 @@ async fn delete_propagates_and_forgets() {
     let engine = engine(&server);
     let dir = RelPath::new("d");
     let child = RelPath::new("d/f");
-    engine
-        .ledger()
-        .observations
-        .insert(child.clone(), Observation::new(1, None));
-    engine.ledger().dirty.insert(child.clone());
+    engine.ledger().observe(&child, Observation::new(1, None));
+    engine.ledger().dirty_set(&child);
 
     engine.delete(&dir, true).await.unwrap();
     rm.assert_hits(1);
