@@ -9,7 +9,7 @@ use fdrive_core::engine::{io_err, Engine, Observation};
 use fdrive_core::port::LocalTree;
 use fdrive_core::path::RelPath;
 use fdrive_core::scheduler::UploadStatus;
-use fdrive_core::sdk::{FileInfo, FileType, Sdk};
+use fdrive_core::sdk::{self, FileInfo, FileType, Sdk};
 use tokio::sync::watch;
 
 use crate::xattr::XattrDb;
@@ -112,20 +112,30 @@ impl Adapter {
     pub fn ls(&self, dir: &RelPath) -> io::Result<Vec<FileInfo>> {
         let listing = match self.cached_listing(dir) {
             Some(listing) => listing,
-            None => {
-                let fetched = self
-                    .engine
-                    .rt()
-                    .block_on(self.engine.sdk().ls(&dir.as_dir()))
-                    .map_err(io_err)?;
-                self.engine
-                    .tree()
-                    .meta
-                    .lock()
-                    .unwrap()
-                    .insert(dir.clone(), (Instant::now(), fetched.clone()));
-                fetched
-            }
+            None => match self.engine.rt().block_on(self.engine.sdk().ls(&dir.as_dir())) {
+                Ok(fetched) => {
+                    self.engine
+                        .tree()
+                        .meta
+                        .lock()
+                        .unwrap()
+                        .insert(dir.clone(), (Instant::now(), fetched.clone()));
+                    fetched
+                }
+                Err(err @ (sdk::Error::NotFound | sdk::Error::PermissionDenied)) => {
+                    return Err(io_err(err))
+                }
+                Err(err) => {
+                    let meta = self.engine.tree().meta.lock().unwrap();
+                    match meta.get(dir) {
+                        Some((_, listing)) => {
+                            log::debug!("ls {dir} unreachable, serving stale: {err}");
+                            listing.clone()
+                        }
+                        None => return Err(io_err(err)),
+                    }
+                }
+            },
         };
         Ok(self.engine.overlay(dir, listing))
     }
@@ -294,4 +304,39 @@ fn remove_path(path: &Path) -> io::Result<()> {
         io::ErrorKind::NotFound => Ok(()),
         _ => Err(err),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ls_serves_the_stale_listing_when_the_server_is_unreachable() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = std::env::temp_dir().join(format!("fdrive-stale-ls-{}", std::process::id()));
+        fs::create_dir_all(&data).unwrap();
+        let sdk = Sdk::new("http://127.0.0.1:9").unwrap();
+        let adapter = Adapter::new(Arc::new(sdk), rt.handle().clone(), &data).unwrap();
+
+        let dir = RelPath::new("d");
+        let expired = Instant::now().checked_sub(Duration::from_secs(600)).unwrap();
+        adapter.engine.tree().meta.lock().unwrap().insert(
+            dir.clone(),
+            (
+                expired,
+                vec![FileInfo {
+                    name: "a.txt".to_string(),
+                    kind: FileType::File,
+                    size: Some(1),
+                    mtime: None,
+                }],
+            ),
+        );
+
+        let listing = adapter.ls(&dir).unwrap();
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].name, "a.txt");
+        assert!(adapter.ls(&RelPath::new("never-seen")).is_err());
+        let _ = fs::remove_dir_all(&data);
+    }
 }
