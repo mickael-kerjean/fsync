@@ -690,3 +690,102 @@ async fn reads_are_served_while_the_download_is_in_flight() {
     download.done().await.unwrap();
     assert_eq!(engine.tree().read("f").unwrap(), b"hello world");
 }
+
+#[tokio::test]
+async fn rename_waits_for_the_inflight_upload() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::HEAD).path("/api/files/cat");
+        then.status(404);
+    });
+    let save = server.mock(|when, then| {
+        when.method(Method::POST)
+            .path("/api/files/cat")
+            .query_param("path", "/a");
+        then.status(200)
+            .json_body(serde_json::json!({"status": "ok"}))
+            .delay(std::time::Duration::from_millis(300));
+    });
+    let mv = server.mock(|when, then| {
+        when.method(Method::POST)
+            .path("/api/files/mv")
+            .query_param("from", "/a")
+            .query_param("to", "/b");
+        then.status(200)
+            .json_body(serde_json::json!({"status": "ok"}));
+    });
+    let engine = engine(&server);
+    let (a, b) = (RelPath::new("a"), RelPath::new("b"));
+    engine.tree().write("a", b"x");
+    mark_dirty(&engine, &a);
+
+    let (uploaded, renamed) = tokio::join!(engine.upload(&a), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.rename(&a, &b, false).await
+    });
+    assert!(matches!(uploaded.unwrap(), Upload::Done));
+    renamed.unwrap();
+    save.assert_hits(1);
+    mv.assert_hits(1);
+}
+
+#[tokio::test]
+async fn uploads_step_aside_during_a_directory_verdict() {
+    let server = MockServer::start();
+    let rm = server.mock(|when, then| {
+        when.method(Method::POST)
+            .path("/api/files/rm")
+            .query_param("path", "/d/");
+        then.status(200)
+            .json_body(serde_json::json!({"status": "ok"}))
+            .delay(std::time::Duration::from_millis(300));
+    });
+    let save = server.mock(|when, then| {
+        when.method(Method::POST).path("/api/files/cat");
+        then.status(200)
+            .json_body(serde_json::json!({"status": "ok"}));
+    });
+    let engine = engine(&server);
+    let (dir, child) = (RelPath::new("d"), RelPath::new("d/f"));
+    engine.tree().write("d/f", b"x");
+    mark_dirty(&engine, &child);
+
+    let (deleted, uploaded) = tokio::join!(engine.delete(&dir, true), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.upload(&child).await
+    });
+    deleted.unwrap();
+    assert!(matches!(uploaded.unwrap(), Upload::Retry));
+    rm.assert_hits(1);
+    save.assert_hits(0);
+}
+
+#[tokio::test]
+async fn the_scheduler_uploads_concurrently() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::HEAD).path("/api/files/cat");
+        then.status(404);
+    });
+    let save = server.mock(|when, then| {
+        when.method(Method::POST).path("/api/files/cat");
+        then.status(200)
+            .json_body(serde_json::json!({"status": "ok"}))
+            .delay(std::time::Duration::from_millis(200));
+    });
+    let engine = engine(&server);
+    let started = std::time::Instant::now();
+    for name in ["a", "b", "c", "d"] {
+        let path = RelPath::new(name);
+        engine.tree().write(name, b"x");
+        mark_dirty(&engine, &path);
+        engine.released(&path);
+    }
+    engine.flush(Duration::from_secs(10)).await;
+    save.assert_hits(4);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(600),
+        "4 uploads at 200ms each finished in {:?}, so they overlapped",
+        started.elapsed()
+    );
+}

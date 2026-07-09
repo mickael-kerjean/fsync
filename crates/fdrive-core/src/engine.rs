@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,32 @@ pub struct Engine<T: LocalTree> {
     status: watch::Receiver<UploadStatus>,
     hydrating: Mutex<HashMap<RelPath, Arc<tokio::sync::Mutex<()>>>>,
     downloads: Mutex<HashMap<RelPath, Arc<Download>>>,
+    uploading: Mutex<HashMap<RelPath, Arc<tokio::sync::Mutex<()>>>>,
+    frozen: Mutex<BTreeSet<RelPath>>,
     weak: Weak<Engine<T>>,
+}
+
+pub(crate) fn gate(
+    gates: &Mutex<HashMap<RelPath, Arc<tokio::sync::Mutex<()>>>>,
+    path: &RelPath,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = gates.lock().unwrap();
+    gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+    gates.entry(path.clone()).or_default().clone()
+}
+
+pub(crate) struct Frozen<'a> {
+    set: &'a Mutex<BTreeSet<RelPath>>,
+    paths: Vec<RelPath>,
+}
+
+impl Drop for Frozen<'_> {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().unwrap();
+        for path in &self.paths {
+            set.remove(path);
+        }
+    }
 }
 
 impl<T: LocalTree> Engine<T> {
@@ -70,6 +95,8 @@ impl<T: LocalTree> Engine<T> {
                 status,
                 hydrating: Mutex::new(HashMap::new()),
                 downloads: Mutex::new(HashMap::new()),
+                uploading: Mutex::new(HashMap::new()),
+                frozen: Mutex::new(BTreeSet::new()),
                 weak: weak.clone(),
             }
         })
@@ -218,7 +245,43 @@ impl<T: LocalTree> Engine<T> {
         fs::metadata(self.tree.backing(path)).ok()
     }
 
+    fn freeze(&self, paths: &[&RelPath]) -> Frozen<'_> {
+        let paths: Vec<RelPath> = paths.iter().map(|p| (*p).clone()).collect();
+        let mut set = self.frozen.lock().unwrap();
+        for path in &paths {
+            set.insert(path.clone());
+        }
+        Frozen {
+            set: &self.frozen,
+            paths,
+        }
+    }
+
+    pub(crate) fn is_frozen(&self, path: &RelPath) -> bool {
+        self.frozen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| path == p || path.is_descendant_of(p))
+    }
+
+    async fn drain(&self, path: &RelPath, subtree: bool) {
+        let gates: Vec<Arc<tokio::sync::Mutex<()>>> = self
+            .uploading
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| *p == path || (subtree && p.is_descendant_of(path)))
+            .map(|(_, gate)| gate.clone())
+            .collect();
+        for gate in gates {
+            let _gate = gate.lock().await;
+        }
+    }
+
     pub async fn delete(&self, path: &RelPath, is_dir: bool) -> io::Result<()> {
+        let _frozen = self.freeze(&[path]);
+        self.drain(path, is_dir).await;
         let local_only = !is_dir && self.ledger().local_only(path);
         if !local_only {
             let api = if is_dir {
@@ -238,6 +301,9 @@ impl<T: LocalTree> Engine<T> {
     }
 
     pub async fn rename(&self, from: &RelPath, to: &RelPath, is_dir: bool) -> io::Result<()> {
+        let _frozen = self.freeze(&[from, to]);
+        self.drain(from, is_dir).await;
+        self.drain(to, false).await;
         if !self.ledger().local_only(from) {
             let (api_from, api_to) = if is_dir {
                 (from.as_dir(), to.as_dir())

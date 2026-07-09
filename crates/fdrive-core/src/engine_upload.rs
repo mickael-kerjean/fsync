@@ -63,6 +63,11 @@ impl<T: LocalTree> Engine<T> {
     }
 
     pub(crate) async fn upload(&self, path: &RelPath) -> io::Result<Upload> {
+        let gate = super::gate(&self.uploading, path);
+        let _gate = gate.lock().await;
+        if self.is_frozen(path) {
+            return Ok(Upload::Retry);
+        }
         if !self.ledger().dirty.contains(path) {
             return Ok(Upload::Done);
         }

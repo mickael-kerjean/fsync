@@ -100,14 +100,9 @@ impl<T: LocalTree> Engine<T> {
     }
 
     pub async fn hydrate_start(&self, path: &RelPath) -> io::Result<()> {
-        let gate = self.hydrating.lock().unwrap().entry(path.clone()).or_default().clone();
+        let gate = super::gate(&self.hydrating, path);
         let _gate = gate.lock().await;
-        let result = self.fetch_start(path).await;
-        let mut hydrating = self.hydrating.lock().unwrap();
-        if hydrating.get(path).is_some_and(|e| Arc::strong_count(e) <= 2) {
-            hydrating.remove(path);
-        }
-        result
+        self.fetch_start(path).await
     }
 
     pub fn download(&self, path: &RelPath) -> Option<Arc<Download>> {
