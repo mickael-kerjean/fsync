@@ -13,6 +13,11 @@ Filestash Sync brings the Dropbox experience to any storage backend, from S3 and
 </p>
 
 <p align="center">
+    <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-apple.png" alt="apple screenshot" />
+    <em>Apple screenshot</em>
+</p>
+
+<p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-linux.png" alt="linux screenshot">
     <em>Linux screenshot</em>
 </p>
