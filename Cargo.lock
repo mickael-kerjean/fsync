@@ -910,9 +910,10 @@ dependencies = [
 name = "fdrive-mac"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "fdrive-core",
- "futures-util",
  "libc",
+ "log",
  "tokio",
 ]
 

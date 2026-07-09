@@ -21,6 +21,7 @@ extern int fsx_release(Handle *h, const char *path);
 extern int fsx_mkdir(Handle *h, const char *path);
 extern int fsx_rm(Handle *h, const char *path, int is_dir);
 extern int fsx_rename(Handle *h, const char *from, const char *to);
+extern void fsx_destroy(Handle *h);
 
 static Handle *H;
 
@@ -122,6 +123,11 @@ static int op_unlink(const char *path) { return fsx_rm(H, path, 0); }
 static int op_rmdir(const char *path) { return fsx_rm(H, path, 1); }
 static int op_rename(const char *from, const char *to) { return fsx_rename(H, from, to); }
 
+static void op_destroy(void *private_data) {
+    (void)private_data;
+    fsx_destroy(H);
+}
+
 static struct fuse_operations ops = {
     .getattr = op_getattr,
     .readdir = op_readdir,
@@ -135,6 +141,7 @@ static struct fuse_operations ops = {
     .unlink = op_unlink,
     .rmdir = op_rmdir,
     .rename = op_rename,
+    .destroy = op_destroy,
 };
 
 int main(int argc, char *argv[]) {
