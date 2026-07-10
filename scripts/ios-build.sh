@@ -25,4 +25,4 @@ xcodebuild -create-xcframework \
 
 xcodegen generate --spec "$IOS/project.yml" --project "$IOS"
 xcodebuild -project "$IOS/Filestash.xcodeproj" -scheme Filestash \
-    -destination 'generic/platform=iOS Simulator' build
+    -destination 'generic/platform=iOS Simulator' ARCHS=arm64 build

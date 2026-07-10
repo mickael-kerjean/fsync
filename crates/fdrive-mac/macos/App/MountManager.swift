@@ -1,7 +1,16 @@
 import AppKit
 
 enum MountManager {
-    private static let binary = "/Users/m1/Downloads/fdrive/target/release/filestashfs"
+    private static var binary: String {
+        if let bundled = Bundle.main.url(forResource: "filestashfs", withExtension: nil) {
+            return bundled.path
+        }
+        if let env = ProcessInfo.processInfo.environment["FILESTASH_FUSE_BIN"], !env.isEmpty {
+            return env
+        }
+        return (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Downloads/fsync/target/release/filestashfs")
+    }
 
     static let mountPoint = (NSHomeDirectory() as NSString).appendingPathComponent("Filestash")
 
