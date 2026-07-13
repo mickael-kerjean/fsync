@@ -4,22 +4,22 @@ A cross platform drive client that does not try to own your storage, but rather 
 
 <p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-windows.png" alt="windows screenshot" />
-    <em>Windows screenshot</em>
+    <em>Windows screenshot of <a href="https://webdav.filestash.app">this webdav</a></em>
 </p>
 
 <p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-apple.png" alt="apple screenshot" />
-    <em>Apple screenshot</em>
+    <em>Apple screenshot of <a href="https://webdav.filestash.app">this webdav</a></em>
 </p>
 
 <p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-android.png" alt="android screenshot" />
-    <em>Android screenshot</em>
+    <em>Android screenshot of <a href="https://webdav.filestash.app">this webdav</a></em>
 </p>
 
 <p align="center">
     <img src="https://downloads.filestash.app/img/app-filestash-www-img-screenshots-sync-linux.png" alt="linux screenshot">
-    <em>Linux screenshot</em>
+    <em>Linux screenshot of <a href="https://webdav.filestash.app">this webdav</a></em>
 </p>
 
 ## Architecture
