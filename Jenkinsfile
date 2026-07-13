@@ -7,7 +7,7 @@ pipeline {
         stage("Test") {
             steps {
                 script {
-                    docker.image("rust:1-trixie").inside("--user=root") {
+                    docker.image("rust:1-trixie").inside {
                         sh "cargo test -p fdrive-core"
                     }
                 }
@@ -38,15 +38,17 @@ pipeline {
         }
         stage("Release") {
             steps {
-                sh "scp target/release/fdrive-linux jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-linux-x86_64"
-                sh "scp target/x86_64-pc-windows-gnu/release/fdrive-windows.exe jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-windows-x86_64.exe"
-                sh "scp crates/fdrive-android/android/app/build/outputs/apk/debug/app-debug.apk jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-android.apk"
+                script {
+                    docker.image("alpine").inside("--user=root --add-host=hal.filestash.app:10.10.102.2") {
+                        withCredentials([sshUserPrivateKey(credentialsId: "app-filestash-hal", keyFileVariable: "SSH_KEY")]) {
+                            sh "apk add openssh-client"
+                            sh "scp -i \$SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=no target/release/fdrive-linux jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-linux-x86_64"
+                            sh "scp -i \$SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=no target/x86_64-pc-windows-gnu/release/fdrive-windows.exe jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-windows-x86_64.exe"
+                            sh "scp -i \$SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=no crates/fdrive-android/android/app/build/outputs/apk/debug/app-debug.apk jenkins@hal.filestash.app:/mnt/me-kerjean-pages/projects/filestash/downloads/fdrive-android.apk"
+                        }
+                    }
+                }
             }
-        }
-    }
-    post {
-        always {
-            cleanWs()
         }
     }
 }
