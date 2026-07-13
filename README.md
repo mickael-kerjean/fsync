@@ -34,10 +34,3 @@ We use the hexagonal architecture / ports and adapters pattern. The core owns al
 | `fdrive-mac` | fuse-t |
 | `fdrive-ios` | FileProvider |
 | `fdrive-android` | Storage Access Framework (Kotlin wire, UniFFI) |
-
-Two adapter families:
-
-- **we are the filesystem** (linux, android, ios): online-first, listings answered live, content cached on open, edits pushed back by the core's scheduler; nothing durable beyond that cache.
-- **the system owns the replica** (windows, mac): placeholders materialize on demand; the only durable local state is the spool of unpushed edits.
-
-The model in one line: the filesystems are the state, the ledger is the memory of where local and remote last agreed — a single sqlite file, updated row by row — dirty is the debt owed upward, and conflicts are detected by comparing the server against that memory. Dirty wins locally; deletes and renames are verdicts (server first, a failure vetoes) that wait out any in-flight upload of the paths they touch, while uploads step aside for them — no orphans on the server, no deadlocks, by construction; a conflicting upload diverts to a "(conflicted copy)"; an unreadable ledger quarantines the cache instead of pruning it. The bytes move with the same care: transfers stream both ways in constant memory whatever the file size, uploads run four at a time and a file edited mid-flight simply goes again, a cold file opened twice is downloaded once, and on the mounts that serve reads directly the first byte lands after one round-trip, reads riding the download as it streams in. When the server is unreachable, listings fall back to the last thing you saw and edits keep queueing for its return.

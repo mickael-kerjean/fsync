@@ -9,8 +9,8 @@ use fdrive_core::config as session;
 use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::Sdk;
 use fdrive_linux::adapter::Adapter;
-use fdrive_linux::wire::MountFs;
 use fdrive_linux::gui::{Credentials, Status, Tray, TrayEvent};
+use fdrive_linux::wire::MountFs;
 use fuser::{Config, MountOption};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -105,7 +105,12 @@ async fn run_session(
     } else {
         builder.token(creds.token.clone())?
     };
-    session::remember(data, &creds.url, sdk.token().unwrap_or_default(), creds.insecure);
+    session::remember(
+        data,
+        &creds.url,
+        sdk.token().unwrap_or_default(),
+        creds.insecure,
+    );
     let sdk = Arc::new(sdk);
     let adapter = Arc::new(Adapter::new(
         sdk.clone(),

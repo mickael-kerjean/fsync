@@ -40,7 +40,10 @@ pub fn init() -> Result<Setup, Box<dyn std::error::Error>> {
         args.password = Some(prompt_password()?);
     }
     let data = args.data.clone().unwrap_or_else(gui::default_data);
-    let setup = setup(args, fdrive_core::config::recall(&data).map(Credentials::from))?;
+    let setup = setup(
+        args,
+        fdrive_core::config::recall(&data).map(Credentials::from),
+    )?;
     std::fs::create_dir_all(&setup.data)?;
     Ok(setup)
 }
@@ -122,7 +125,11 @@ mod tests {
 
     #[test]
     fn token_mode() {
-        let s = setup(parse(&["--server", "localhost:8334", "--token", "t0k"]), None).unwrap();
+        let s = setup(
+            parse(&["--server", "localhost:8334", "--token", "t0k"]),
+            None,
+        )
+        .unwrap();
         let creds = s.credentials.unwrap();
         assert_eq!(creds.url, "https://localhost:8334");
         assert_eq!(creds.token, "t0k");
@@ -131,7 +138,14 @@ mod tests {
 
     #[test]
     fn password_mode() {
-        let mut args = parse(&["--server", "http://x/", "--user", "joe", "--storage", "docs"]);
+        let mut args = parse(&[
+            "--server",
+            "http://x/",
+            "--user",
+            "joe",
+            "--storage",
+            "docs",
+        ]);
         args.password = Some("s3cret".into());
         let creds = setup(args, None).unwrap().credentials.unwrap();
         assert_eq!(creds.url, "http://x");

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use fdrive_core::engine::{io_err, Engine, Observation};
-use fdrive_core::port::LocalTree;
 use fdrive_core::path::RelPath;
+use fdrive_core::port::LocalTree;
 use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::{self, FileInfo, FileType, Sdk};
 use tokio::sync::watch;
@@ -119,7 +119,11 @@ impl Adapter {
     pub fn ls(&self, dir: &RelPath) -> io::Result<Vec<FileInfo>> {
         let listing = match self.cached_listing(dir) {
             Some(listing) => listing,
-            None => match self.engine.rt().block_on(self.engine.sdk().ls(&dir.as_dir())) {
+            None => match self
+                .engine
+                .rt()
+                .block_on(self.engine.sdk().ls(&dir.as_dir()))
+            {
                 Ok(fetched) => {
                     self.engine
                         .tree()
@@ -195,7 +199,9 @@ impl Adapter {
         if current.is_some_and(|current| self.engine.content_current(path, current)) {
             return Ok(());
         }
-        self.engine.rt().block_on(self.engine.hydrate(path, current))
+        self.engine
+            .rt()
+            .block_on(self.engine.hydrate(path, current))
     }
 
     pub fn hydrate_start(&self, path: &RelPath) -> io::Result<()> {
@@ -313,9 +319,7 @@ impl Adapter {
         remove_path(&self.backing(path))?;
         self.xattrs.forget(path);
         self.invalidate(path);
-        self.engine
-            .tree()
-            .drop(&path.parent_or_root(), path.name());
+        self.engine.tree().drop(&path.parent_or_root(), path.name());
         Ok(())
     }
 
@@ -396,7 +400,9 @@ mod tests {
         let adapter = Adapter::new(Arc::new(sdk), rt.handle().clone(), &data).unwrap();
 
         let dir = RelPath::new("d");
-        let expired = Instant::now().checked_sub(Duration::from_secs(600)).unwrap();
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
         adapter.engine.tree().meta.lock().unwrap().insert(
             dir.clone(),
             (

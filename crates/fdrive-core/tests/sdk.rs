@@ -67,8 +67,10 @@ async fn probe_accepts_filestash_and_returns_version() {
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path("/about");
-        then.status(200)
-            .header("X-Powered-By", "Filestash/v0.6.20260615 <https://filestash.app>");
+        then.status(200).header(
+            "X-Powered-By",
+            "Filestash/v0.6.20260615 <https://filestash.app>",
+        );
     });
 
     let version = Sdk::builder(&server.base_url()).probe().await.unwrap();

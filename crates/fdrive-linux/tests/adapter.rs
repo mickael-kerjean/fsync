@@ -41,9 +41,8 @@ fn ls_mock<'a>(server: &'a MockServer, path: &str, entries: &str) -> httpmock::M
         when.method(GET)
             .path("/api/files/ls")
             .query_param("path", path);
-        then.status(200).json_body_obj(
-            &serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-        );
+        then.status(200)
+            .json_body_obj(&serde_json::from_str::<serde_json::Value>(&body).unwrap());
     })
 }
 

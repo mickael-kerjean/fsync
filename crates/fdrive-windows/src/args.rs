@@ -60,7 +60,12 @@ pub fn init() -> Result<Option<Setup>, Box<dyn std::error::Error>> {
         .join("Filestash");
     std::fs::create_dir_all(&data)?;
 
-    match setup(args, fdrive_core::config::recall(&data).map(Credentials::from), root, data) {
+    match setup(
+        args,
+        fdrive_core::config::recall(&data).map(Credentials::from),
+        root,
+        data,
+    ) {
         Ok(setup) => Ok(Some(setup)),
         Err(err) => {
             gui::alert(&err);

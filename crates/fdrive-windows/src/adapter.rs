@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use fdrive_core::engine::{io_err, Engine, Observation};
-use fdrive_core::port::LocalTree;
 use fdrive_core::path::RelPath;
+use fdrive_core::port::LocalTree;
 use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::{Error as SdkError, FileInfo, FileType, Sdk};
 use futures_util::TryStreamExt;
@@ -204,11 +204,7 @@ impl Adapter {
         const FLUSH_AT: usize = 1 << 20;
         let sdk = self.engine.sdk().clone();
         let api = path.as_file();
-        let info = self
-            .engine
-            .rt()
-            .block_on(sdk.stat(&api))
-            .map_err(io_err)?;
+        let info = self.engine.rt().block_on(sdk.stat(&api)).map_err(io_err)?;
         let size = info.size.unwrap_or(0);
         if size as i64 != expected {
             let mtime = info.mtime.unwrap_or_else(SystemTime::now);
@@ -607,10 +603,12 @@ impl Adapter {
                     Ok(FileState::Edited) if self.engine.ledger().dirty_set(&child) => {
                         armed.push(child);
                     }
-                    Ok(FileState::Cached(Pin::Unpinned)) => match wire::set_hydration(&abs, false) {
-                        Ok(()) => dehydrated += 1,
-                        Err(err) => log::debug!("dehydrate {child}: {err}"),
-                    },
+                    Ok(FileState::Cached(Pin::Unpinned)) => {
+                        match wire::set_hydration(&abs, false) {
+                            Ok(()) => dehydrated += 1,
+                            Err(err) => log::debug!("dehydrate {child}: {err}"),
+                        }
+                    }
                     _ => {}
                 }
             }

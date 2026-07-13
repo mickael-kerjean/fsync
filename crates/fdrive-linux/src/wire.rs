@@ -83,7 +83,11 @@ impl Filesystem for MountFs {
                 wire.bump(attr.ino.0);
                 reply.entry(&TTL_OK, &attr, Generation(0));
             }
-            None => reply.entry(&TTL_NOK, &wire.make_attr(0, false, 0, SystemTime::UNIX_EPOCH), Generation(0)),
+            None => reply.entry(
+                &TTL_NOK,
+                &wire.make_attr(0, false, 0, SystemTime::UNIX_EPOCH),
+                Generation(0),
+            ),
         });
     }
 
@@ -268,10 +272,12 @@ impl Filesystem for MountFs {
         let Some(path) = self.wire.path(ino.0) else {
             return reply.error(Errno::ENOENT);
         };
-        self.go(move |wire| match wire.adapter.read(fh.0, &path, offset, size) {
-            Ok(data) => reply.data(&data),
-            Err(err) => reply.error(Errno::from(err)),
-        });
+        self.go(
+            move |wire| match wire.adapter.read(fh.0, &path, offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(err) => reply.error(Errno::from(err)),
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -291,10 +297,12 @@ impl Filesystem for MountFs {
             return reply.error(Errno::ENOENT);
         };
         let data = data.to_vec();
-        self.go(move |wire| match wire.adapter.write(fh.0, &path, offset, &data) {
-            Ok(written) => reply.written(written),
-            Err(err) => reply.error(Errno::from(err)),
-        });
+        self.go(
+            move |wire| match wire.adapter.write(fh.0, &path, offset, &data) {
+                Ok(written) => reply.written(written),
+                Err(err) => reply.error(Errno::from(err)),
+            },
+        );
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -333,9 +341,10 @@ impl Filesystem for MountFs {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let (Some(from), Some(to)) =
-            (self.wire.child(parent.0, name), self.wire.child(newparent.0, newname))
-        else {
+        let (Some(from), Some(to)) = (
+            self.wire.child(parent.0, name),
+            self.wire.child(newparent.0, newname),
+        ) else {
             return reply.error(Errno::ENOENT);
         };
         self.go(move |wire| {
@@ -582,9 +591,16 @@ mod tests {
         let mut t = table();
         let ino = t.ino(&RelPath::new("listed-only")); // readdir-style, never bumped
         t.forget(ino, 1);
-        assert!(t.paths.contains_key(&ino), "no lookup count, nothing to forget");
+        assert!(
+            t.paths.contains_key(&ino),
+            "no lookup count, nothing to forget"
+        );
         t.bump(ROOT);
         t.forget(ROOT, 1);
-        assert_eq!(t.paths.get(&ROOT), Some(&RelPath::root()), "root is never freed");
+        assert_eq!(
+            t.paths.get(&ROOT),
+            Some(&RelPath::root()),
+            "root is never freed"
+        );
     }
 }

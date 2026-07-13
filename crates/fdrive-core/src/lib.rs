@@ -19,7 +19,7 @@ pub fn byte_stream(data: impl Into<Bytes>) -> ByteStream {
     ))))
 }
 
-pub async fn file_stream(path: &std::path::Path) -> io::Result<ByteStream> {
+pub(crate) async fn file_stream(path: &std::path::Path) -> io::Result<ByteStream> {
     let file = tokio::fs::File::open(path).await?;
     Ok(Box::pin(tokio_util::io::ReaderStream::new(file)))
 }

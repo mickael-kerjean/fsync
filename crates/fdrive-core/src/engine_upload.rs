@@ -7,15 +7,15 @@ use crate::path::RelPath;
 use crate::port::LocalTree;
 use crate::sdk::{Error as SdkError, Sdk};
 
-use super::{io_err, Engine};
 use super::Observation;
+use super::{io_err, Engine};
 
 pub enum Upload {
     Done,
     Retry,
 }
 
-pub async fn save_with_parents(
+async fn save_with_parents(
     sdk: &Sdk,
     target: &RelPath,
     source: &Path,

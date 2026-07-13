@@ -1,12 +1,12 @@
 #![windows_subsystem = "windows"]
 
-mod args;
-mod wire;
-mod config;
 mod adapter;
+mod args;
+mod config;
 mod gui;
 mod log;
 mod webview;
+mod wire;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,10 +20,10 @@ use fdrive_core::sdk::Sdk;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
 
-use crate::wire::{shell, viewer, watcher};
-use crate::config::AppConfig;
 use crate::adapter::Adapter;
+use crate::config::AppConfig;
 use crate::gui::{Credentials, Status, Tray, TrayEvent, TrayState};
+use crate::wire::{shell, viewer, watcher};
 
 #[tokio::main]
 async fn main() {
@@ -176,7 +176,12 @@ async fn session(
     } else {
         builder.token(creds.token.clone())?
     };
-    session::remember(data, &creds.url, sdk.token().unwrap_or_default(), creds.insecure);
+    session::remember(
+        data,
+        &creds.url,
+        sdk.token().unwrap_or_default(),
+        creds.insecure,
+    );
     let sdk = Arc::new(sdk);
     let adapter = Adapter::new(
         sdk.clone(),

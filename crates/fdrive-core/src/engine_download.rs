@@ -101,7 +101,11 @@ impl<T: LocalTree> Engine<T> {
         }
     }
 
-    pub async fn hydrate_start(&self, path: &RelPath, current: Option<Observation>) -> io::Result<()> {
+    pub async fn hydrate_start(
+        &self,
+        path: &RelPath,
+        current: Option<Observation>,
+    ) -> io::Result<()> {
         let gate = super::gate(&self.hydrating, path);
         let _gate = gate.lock().await;
         self.fetch_start(path, current).await

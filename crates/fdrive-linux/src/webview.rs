@@ -81,10 +81,17 @@ unsafe extern "C" fn on_uri(_view: *mut c_void, _pspec: *mut c_void, data: *mut 
     if !on_files || state.busy.replace(true) {
         return;
     }
-    let manager = (state.wk.web_context_get_cookie_manager)((state.wk.web_view_get_context)(state.view));
+    let manager =
+        (state.wk.web_context_get_cookie_manager)((state.wk.web_view_get_context)(state.view));
     let api = CString::new(format!("{}/api/", state.base)).unwrap();
     Rc::increment_strong_count(data as *const State);
-    (state.wk.cookie_manager_get_cookies)(manager, api.as_ptr(), std::ptr::null_mut(), on_cookies, data);
+    (state.wk.cookie_manager_get_cookies)(
+        manager,
+        api.as_ptr(),
+        std::ptr::null_mut(),
+        on_cookies,
+        data,
+    );
 }
 
 unsafe extern "C" fn on_cookies(manager: *mut c_void, result: *mut c_void, data: *mut c_void) {
@@ -133,8 +140,11 @@ struct WebKit {
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
         *mut c_void,
     ),
-    cookie_manager_get_cookies_finish:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> *mut gtk::glib::ffi::GList,
+    cookie_manager_get_cookies_finish: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut *mut c_void,
+    ) -> *mut gtk::glib::ffi::GList,
     soup_cookie_get_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     soup_cookie_get_value: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     soup_cookie_free: unsafe extern "C" fn(*mut c_void),

@@ -44,7 +44,7 @@ pub struct Ledger {
 
 const SUBTREE: &str = "path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')";
 
-pub fn open_db(file: &Path, schema: &str) -> rusqlite::Result<rusqlite::Connection> {
+fn open_db(file: &Path, schema: &str) -> rusqlite::Result<rusqlite::Connection> {
     let db = rusqlite::Connection::open(file)?;
     db.busy_timeout(Duration::from_secs(5))?;
     db.pragma_update(None, "synchronous", "OFF")?;
@@ -54,7 +54,7 @@ pub fn open_db(file: &Path, schema: &str) -> rusqlite::Result<rusqlite::Connecti
 }
 
 impl Ledger {
-    pub fn open(file: &Path) -> Result<Self, ()> {
+    pub(crate) fn open(file: &Path) -> Result<Self, ()> {
         let load = || -> rusqlite::Result<Self> {
             let db = open_db(
                 file,
@@ -91,7 +91,10 @@ impl Ledger {
 
     fn exec(&self, sql: &str, params: impl rusqlite::Params) {
         if let Some(db) = &self.db {
-            match db.prepare_cached(sql).and_then(|mut stmt| stmt.execute(params)) {
+            match db
+                .prepare_cached(sql)
+                .and_then(|mut stmt| stmt.execute(params))
+            {
                 Ok(_) => {}
                 Err(err) => log::error!("ledger: {err}"),
             }
@@ -101,7 +104,10 @@ impl Ledger {
     pub fn dirty_set(&mut self, path: &RelPath) -> bool {
         let inserted = self.dirty.insert(path.clone());
         if inserted {
-            self.exec("INSERT OR IGNORE INTO dirty(path) VALUES (?1)", [path.as_str()]);
+            self.exec(
+                "INSERT OR IGNORE INTO dirty(path) VALUES (?1)",
+                [path.as_str()],
+            );
         }
         inserted
     }
@@ -135,7 +141,10 @@ impl Ledger {
             &format!("DELETE FROM observations WHERE {SUBTREE}"),
             [path.as_str()],
         );
-        self.exec(&format!("DELETE FROM dirty WHERE {SUBTREE}"), [path.as_str()]);
+        self.exec(
+            &format!("DELETE FROM dirty WHERE {SUBTREE}"),
+            [path.as_str()],
+        );
     }
 
     pub fn remap(&mut self, from: &RelPath, to: &RelPath) {
@@ -167,12 +176,15 @@ impl Ledger {
             self.dirty.remove(&p);
             self.exec("DELETE FROM dirty WHERE path = ?1", [p.as_str()]);
             let dest = rebase(&p);
-            self.exec("INSERT OR REPLACE INTO dirty(path) VALUES (?1)", [dest.as_str()]);
+            self.exec(
+                "INSERT OR REPLACE INTO dirty(path) VALUES (?1)",
+                [dest.as_str()],
+            );
             self.dirty.insert(dest);
         }
     }
 
-    pub fn local_only(&self, path: &RelPath) -> bool {
+    pub(crate) fn local_only(&self, path: &RelPath) -> bool {
         !self.observations.contains_key(path) && self.dirty.contains(path)
     }
 }

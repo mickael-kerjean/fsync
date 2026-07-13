@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::path::RelPath;
@@ -20,11 +19,11 @@ pub use ledger::{Ledger, Observation};
 
 #[path = "engine_download.rs"]
 mod download;
-pub use download::{Download, DownloadStatus};
+pub use download::Download;
 
 #[path = "engine_upload.rs"]
 mod upload;
-pub use upload::{save_with_parents, Upload};
+pub(crate) use upload::Upload;
 
 #[cfg(test)]
 #[path = "engine_test.rs"]

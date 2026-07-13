@@ -228,7 +228,13 @@ impl Sdk {
             .get("X-Powered-By")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Filestash/"))
-            .map(|version| version.split_whitespace().next().unwrap_or(version).to_string())
+            .map(|version| {
+                version
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(version)
+                    .to_string()
+            })
             .ok_or(Error::NotFilestash)
     }
 

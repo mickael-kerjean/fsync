@@ -259,7 +259,9 @@ fn remove_path(path: &Path) -> io::Result<()> {
 }
 
 fn cstr(ptr: *const c_char) -> String {
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn rel(ptr: *const c_char) -> RelPath {
@@ -320,10 +322,16 @@ fn init_log() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fsx_connect(url: *const c_char, token: *const c_char, insecure: c_int) -> *mut Handle {
+pub unsafe extern "C" fn fsx_connect(
+    url: *const c_char,
+    token: *const c_char,
+    insecure: c_int,
+) -> *mut Handle {
     init_log();
     let (url, token) = (cstr(url), cstr(token));
-    let Ok(rt) = Runtime::new() else { return std::ptr::null_mut() };
+    let Ok(rt) = Runtime::new() else {
+        return std::ptr::null_mut();
+    };
     let Ok(sdk) = Sdk::builder(&url).insecure(insecure != 0).token(token) else {
         return std::ptr::null_mut();
     };
@@ -378,12 +386,19 @@ pub type FillCb =
     extern "C" fn(ctx: *mut c_void, name: *const c_char, is_dir: c_int, size: u64, mtime: i64);
 
 #[no_mangle]
-pub unsafe extern "C" fn fsx_readdir(h: *mut Handle, path: *const c_char, fill: FillCb, ctx: *mut c_void) -> c_int {
+pub unsafe extern "C" fn fsx_readdir(
+    h: *mut Handle,
+    path: *const c_char,
+    fill: FillCb,
+    ctx: *mut c_void,
+) -> c_int {
     let h = unsafe { &*h };
     match h.ls(&rel(path)) {
         Ok(entries) => {
             for e in entries {
-                let Ok(name) = CString::new(e.name) else { continue };
+                let Ok(name) = CString::new(e.name) else {
+                    continue;
+                };
                 let is_dir = i32::from(e.kind == FileType::Directory);
                 let mtime = e.mtime.map(mtime_secs).unwrap_or(0);
                 fill(ctx, name.as_ptr(), is_dir, e.size.unwrap_or(0), mtime);
@@ -465,7 +480,11 @@ pub unsafe extern "C" fn fsx_rm(h: *mut Handle, path: *const c_char, is_dir: c_i
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn fsx_rename(h: *mut Handle, from: *const c_char, to: *const c_char) -> c_int {
+pub unsafe extern "C" fn fsx_rename(
+    h: *mut Handle,
+    from: *const c_char,
+    to: *const c_char,
+) -> c_int {
     let h = unsafe { &*h };
     done(h.rename(&rel(from), &rel(to)))
 }

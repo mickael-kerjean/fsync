@@ -73,7 +73,9 @@ pub fn login(base: &str, insecure: bool, data: &Path) -> Result<Option<String>, 
         let options = insecure.then(Options::create);
         let on_env = {
             let state = state.clone();
-            Completion::create(IID_ENV_COMPLETED, move |hr, env| on_environment(&state, hr, env))
+            Completion::create(IID_ENV_COMPLETED, move |hr, env| {
+                on_environment(&state, hr, env)
+            })
         };
         let hr = create(
             true,
@@ -223,10 +225,13 @@ unsafe fn on_source_changed(state: &Rc<State>) {
     }
     let on_cookies = {
         let state = state.clone();
-        Completion::create(IID_GET_COOKIES, move |hr, list| on_cookies(&state, hr, list))
+        Completion::create(IID_GET_COOKIES, move |hr, list| {
+            on_cookies(&state, hr, list)
+        })
     };
     let uri = wide(&format!("{}/api/", state.base));
-    let _ = (vt::<CookieManagerVtbl>(manager).get_cookies)(manager, PCWSTR(uri.as_ptr()), on_cookies);
+    let _ =
+        (vt::<CookieManagerVtbl>(manager).get_cookies)(manager, PCWSTR(uri.as_ptr()), on_cookies);
     com_release(on_cookies);
     com_release(manager);
 }
@@ -270,9 +275,18 @@ fn load_runtime() -> Result<CreateEnvironment, String> {
         _ => "x86",
     };
     let candidates = [
-        (windows_registry::CURRENT_USER, format!(r"SOFTWARE\{CLIENT}")),
-        (windows_registry::LOCAL_MACHINE, format!(r"SOFTWARE\WOW6432Node\{CLIENT}")),
-        (windows_registry::LOCAL_MACHINE, format!(r"SOFTWARE\{CLIENT}")),
+        (
+            windows_registry::CURRENT_USER,
+            format!(r"SOFTWARE\{CLIENT}"),
+        ),
+        (
+            windows_registry::LOCAL_MACHINE,
+            format!(r"SOFTWARE\WOW6432Node\{CLIENT}"),
+        ),
+        (
+            windows_registry::LOCAL_MACHINE,
+            format!(r"SOFTWARE\{CLIENT}"),
+        ),
     ];
     for (root, key) in candidates {
         let Ok(dir) = root.open(&key).and_then(|key| key.get_string("EBWebView")) else {
@@ -570,8 +584,7 @@ struct OptionsVtbl {
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
-    get_additional_browser_arguments:
-        unsafe extern "system" fn(*mut c_void, *mut PWSTR) -> HRESULT,
+    get_additional_browser_arguments: unsafe extern "system" fn(*mut c_void, *mut PWSTR) -> HRESULT,
     put_additional_browser_arguments: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT,
     get_language: unsafe extern "system" fn(*mut c_void, *mut PWSTR) -> HRESULT,
     put_language: unsafe extern "system" fn(*mut c_void, PCWSTR) -> HRESULT,

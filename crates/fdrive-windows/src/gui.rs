@@ -22,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_AUTOHSCROLL, HICON, HMENU, IDI_APPLICATION, IMAGE_FLAGS, MB_ICONERROR, MB_ICONINFORMATION,
     MB_OK, MESSAGEBOX_STYLE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PM_REMOVE, SW_SHOWNORMAL,
     TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub fn alert(message: &str) {
@@ -481,24 +481,30 @@ fn login_dialog(prefill: Credentials) -> Option<Credentials> {
         .ok()?;
 
         let font = GetStockObject(DEFAULT_GUI_FONT);
-        let child = |class: PCWSTR, text: PCWSTR, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| {
-            if let Ok(ctl) = CreateWindowExW(
-                Default::default(),
-                class,
-                text,
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-                x,
-                y,
-                w,
-                h,
-                Some(hwnd),
-                Some(HMENU(id as _)),
-                Some(instance.into()),
-                None,
-            ) {
-                SendMessageW(ctl, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-            }
-        };
+        let child =
+            |class: PCWSTR, text: PCWSTR, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| {
+                if let Ok(ctl) = CreateWindowExW(
+                    Default::default(),
+                    class,
+                    text,
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
+                    x,
+                    y,
+                    w,
+                    h,
+                    Some(hwnd),
+                    Some(HMENU(id as _)),
+                    Some(instance.into()),
+                    None,
+                ) {
+                    SendMessageW(
+                        ctl,
+                        WM_SETFONT,
+                        Some(WPARAM(font.0 as usize)),
+                        Some(LPARAM(1)),
+                    );
+                }
+            };
         child(w!("STATIC"), w!("Server"), 0, 12, 18, 80, 20, 0);
         child(
             w!("EDIT"),
@@ -520,7 +526,16 @@ fn login_dialog(prefill: Credentials) -> Option<Credentials> {
             26,
             ID_OK,
         );
-        child(w!("BUTTON"), w!("Cancel"), WS_TABSTOP.0, 245, 55, 85, 26, ID_CANCEL);
+        child(
+            w!("BUTTON"),
+            w!("Cancel"),
+            WS_TABSTOP.0,
+            245,
+            55,
+            85,
+            26,
+            ID_CANCEL,
+        );
         set_text(hwnd, ID_SERVER, &prefill.url);
         let _ = SetForegroundWindow(hwnd);
         if let Ok(first) = GetDlgItem(Some(hwnd), ID_SERVER) {
@@ -551,7 +566,9 @@ fn login_dialog(prefill: Credentials) -> Option<Credentials> {
                     .insecure(prefill.insecure)
                     .probe_blocking()
                 {
-                    alert(&format!("{url} does not look like a Filestash server.\n\n{err}"));
+                    alert(&format!(
+                        "{url} does not look like a Filestash server.\n\n{err}"
+                    ));
                     return None;
                 }
                 let data = CTX.with_borrow(|ctx| {

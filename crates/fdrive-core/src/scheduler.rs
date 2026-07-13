@@ -49,7 +49,9 @@ pub(crate) async fn run<T: LocalTree>(
                 .map(|(path, _)| path.clone());
             let Some(path) = due else { break };
             pending.remove(&path);
-            let Some(engine) = engine.upgrade() else { return };
+            let Some(engine) = engine.upgrade() else {
+                return;
+            };
             inflight.insert(path.clone());
             running.spawn(async move {
                 let result = engine.upload(&path).await;

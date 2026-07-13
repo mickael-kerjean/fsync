@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use fdrive_core::engine::{Engine, Observation};
-use fdrive_core::port::LocalTree;
 use fdrive_core::path::RelPath;
+use fdrive_core::port::LocalTree;
 use fdrive_core::sdk::{self, Sdk};
 use tokio::runtime::Runtime;
 
@@ -202,11 +202,7 @@ impl Adapter {
 
     pub fn ls(&self, path: String) -> Result<Vec<Entry>, FsError> {
         let dir = rel(&path);
-        Ok(self
-            .listing(&dir)?
-            .into_iter()
-            .map(Entry::from)
-            .collect())
+        Ok(self.listing(&dir)?.into_iter().map(Entry::from).collect())
     }
 
     pub fn stat(&self, path: String) -> Result<Entry, FsError> {
@@ -266,8 +262,7 @@ impl Adapter {
 
     pub fn mkdir(&self, path: String) -> Result<(), FsError> {
         let rel = rel(&path);
-        self.rt
-            .block_on(self.engine.sdk().mkdir(&rel.as_dir()))?;
+        self.rt.block_on(self.engine.sdk().mkdir(&rel.as_dir()))?;
         self.engine.tree().invalidate(&rel.parent_or_root());
         Ok(())
     }

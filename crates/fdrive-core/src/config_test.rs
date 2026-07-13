@@ -24,7 +24,10 @@ fn session_round_trip() {
     assert!(!session.insecure);
     super::forget(&data);
     assert!(super::recall(&data).is_none());
-    assert!(!data.join("fdrive.toml").exists(), "empty config is removed");
+    assert!(
+        !data.join("fdrive.toml").exists(),
+        "empty config is removed"
+    );
 }
 
 #[test]
@@ -36,7 +39,10 @@ fn login_and_logout_leave_the_rest_of_the_config_alone() {
     assert!(super::recall(&data).unwrap().insecure);
     super::forget(&data);
     let text = std::fs::read_to_string(&config).unwrap();
-    assert!(text.contains("node_modules"), "foreign table survives: {text}");
+    assert!(
+        text.contains("node_modules"),
+        "foreign table survives: {text}"
+    );
     assert!(!text.contains("session"));
 }
 
