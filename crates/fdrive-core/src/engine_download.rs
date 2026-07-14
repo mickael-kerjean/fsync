@@ -132,10 +132,17 @@ impl<T: LocalTree> Engine<T> {
         if dirty {
             return Ok(());
         }
+        // a deleted-but-not-yet-replayed path is locally gone; a renamed one
+        // still lives upstream under its old name
+        let upstream = match self.fates().get(path) {
+            Some(super::Fate::Gone) => return Err(io::ErrorKind::NotFound.into()),
+            Some(super::Fate::Arrived { from, .. }) => from.clone(),
+            None => path.clone(),
+        };
         let abs = self.tree.backing(path);
         let current = match current {
             Some(current) => current,
-            None => match self.sdk.stat(&path.as_file()).await {
+            None => match self.sdk.stat(&upstream.as_file()).await {
                 Ok(info) => Observation::of(&info),
                 Err(err @ (SdkError::NotFound | SdkError::PermissionDenied)) => {
                     return Err(io_err(err))
@@ -179,7 +186,8 @@ impl<T: LocalTree> Engine<T> {
             tx.send_modify(|s| s.1 = DownloadStatus::Failed);
         };
         let downloaded = async {
-            let (info, mut stream) = self.sdk.cat(&path.as_file()).await.map_err(io_err)?;
+            let upstream = self.upstream_of(&path).unwrap_or_else(|| path.clone());
+            let (info, mut stream) = self.sdk.cat(&upstream.as_file()).await.map_err(io_err)?;
             let mut file = fs::File::options().append(true).open(&tmp)?;
             let mut size: u64 = 0;
             while let Some(chunk) = stream.try_next().await? {

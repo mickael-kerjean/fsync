@@ -125,6 +125,7 @@ impl Adapter {
                 .block_on(self.engine.sdk().ls(&dir.as_dir()))
             {
                 Ok(fetched) => {
+                    self.engine.listed(dir, &fetched);
                     self.engine
                         .tree()
                         .meta
@@ -157,16 +158,10 @@ impl Adapter {
         (at.elapsed() < META_TTL).then(|| listing.clone())
     }
 
+    // always through ls(): the raw meta cache doesn't know the journal's
+    // pending fates, serving it unfiltered resurrects tombstoned names
     fn entry(&self, path: &RelPath) -> io::Result<Option<FileInfo>> {
         let parent = path.parent_or_root();
-        {
-            let meta = self.engine.tree().meta.lock().unwrap();
-            if let Some((at, listing)) = meta.get(&parent) {
-                if at.elapsed() < META_TTL {
-                    return Ok(listing.iter().find(|e| e.name == path.name()).cloned());
-                }
-            }
-        }
         match self.ls(&parent) {
             Ok(listing) => Ok(listing.iter().find(|e| e.name == path.name()).cloned()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),

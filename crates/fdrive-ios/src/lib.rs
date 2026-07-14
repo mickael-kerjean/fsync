@@ -320,6 +320,7 @@ impl Adapter {
             Some(listing) => listing,
             None => {
                 let fetched = self.rt.block_on(self.engine.sdk().ls(&dir.as_dir()))?;
+                self.engine.listed(dir, &fetched);
                 self.engine
                     .tree()
                     .meta

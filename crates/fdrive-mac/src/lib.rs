@@ -73,6 +73,7 @@ impl Handle {
             Some(listing) => listing,
             None => match self.rt.block_on(self.engine.sdk().ls(&dir.as_dir())) {
                 Ok(fetched) => {
+                    self.engine.listed(dir, &fetched);
                     self.engine
                         .tree()
                         .meta

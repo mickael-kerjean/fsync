@@ -7,13 +7,7 @@ use crate::path::RelPath;
 use crate::port::LocalTree;
 use crate::sdk::{Error as SdkError, Sdk};
 
-use super::Observation;
-use super::{io_err, Engine};
-
-pub enum Upload {
-    Done,
-    Retry,
-}
+use super::{io_err, Conflict, Engine, Observation, Operation, Replayed};
 
 enum Saved {
     Done(Option<SystemTime>),
@@ -53,38 +47,51 @@ impl<T: LocalTree> Engine<T> {
         dir.join(&format!("{stem} (conflicted copy){ext}"))
     }
 
-    pub(crate) async fn upload(&self, path: &RelPath) -> io::Result<Upload> {
+    pub(crate) async fn replay_save(
+        &self,
+        path: &RelPath,
+        replaces: Option<Observation>,
+        reuses: Option<&RelPath>,
+    ) -> io::Result<Replayed> {
         let gate = super::gate(&self.uploading, path);
         let _gate = gate.lock().await;
         if self.is_frozen(path) {
-            return Ok(Upload::Retry);
-        }
-        if !self.ledger().dirty.contains(path) {
-            return Ok(Upload::Done);
+            return Ok(Replayed::Busy);
         }
         if self.ignore.matches(path) {
+            // retire the intent but stay dirty so the overlay keeps showing it
             log::debug!("{path} is ignored");
-            return Ok(Upload::Done);
+            return Ok(Replayed::Done);
         }
         let abs = self.tree.backing(path);
         let md = match fs::metadata(&abs) {
             Ok(md) => md,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // the bytes vanished locally; a delete is coalescing behind us
                 self.ledger().dirty_clear(path);
-                return Ok(Upload::Done);
+                return Ok(Replayed::Done);
             }
             Err(err) => return Err(err),
         };
         let before = md.modified().ok();
+        let since = UNIX_EPOCH + Duration::from_secs(replaces.map_or(0, |r| r.time));
 
-        let recorded = self.ledger().observations.get(path).copied();
-        let since = UNIX_EPOCH + Duration::from_secs(recorded.map_or(0, |rec| rec.time));
-        let delta = match self.delta_source(path) {
-            Some((sig, base, time)) => {
-                let base_since = UNIX_EPOCH + Duration::from_secs(time);
-                upload_delta(&self.sdk, path, &abs, sig, base.as_ref(), base_since).await
+        // delta off the cross-path source when the burst revealed one,
+        // else off our own last-synced signature
+        let delta = {
+            let source = reuses.unwrap_or(path);
+            let sig = self.ledger().sign_get(source);
+            let time = match reuses {
+                Some(base) => self.ledger().observations.get(base).map(|o| o.time),
+                None => replaces.map(|r| r.time),
+            };
+            match (sig, time) {
+                (Some(sig), Some(time)) => {
+                    let base_since = UNIX_EPOCH + Duration::from_secs(time);
+                    upload_delta(&self.sdk, path, &abs, sig, reuses, base_since).await
+                }
+                _ => None,
             }
-            None => None,
         };
         let attempt = match delta {
             Some(saved) => saved,
@@ -93,10 +100,27 @@ impl<T: LocalTree> Engine<T> {
         let (target, mtime) = match attempt {
             Saved::Done(mtime) => (path.clone(), mtime),
             Saved::Conflict => {
+                let found = match self.sdk.stat(&path.as_file()).await {
+                    Ok(info) => Some(Observation::of(&info)),
+                    Err(_) => None,
+                };
                 let target = self.conflict_target(path).await;
                 log::warn!("conflict on {path}: uploading as {target}");
                 match upload_full(&self.sdk, &target, &abs, None).await? {
-                    Saved::Done(mtime) => (target, mtime),
+                    Saved::Done(mtime) => {
+                        self.conflicted(Conflict {
+                            seq: 0,
+                            op: Operation::Write(path.clone()),
+                            expected: replaces,
+                            found,
+                            ours: Some(target.clone()),
+                            at: SystemTime::now(),
+                        });
+                        if let Some(found) = found {
+                            self.ledger().observe(path, found);
+                        }
+                        (target, mtime)
+                    }
                     Saved::Conflict => return Err(io::Error::other("conflict copy was preempted")),
                 }
             }
@@ -108,26 +132,24 @@ impl<T: LocalTree> Engine<T> {
                 self.ledger().observe(path, rec);
             }
         }
-
         {
             let mut ledger = self.ledger();
             ledger.dirty_clear(path);
             ledger.dirty_clear(&target);
         }
         let after = fs::metadata(&abs).ok().and_then(|md| md.modified().ok());
-        if after != before {
+        if after != before && target == *path {
+            // edited while uploading: a fresh burst takes over
+            self.record(Operation::Write(path.clone()));
             self.ledger().dirty_set(path);
-            return Ok(Upload::Retry);
         }
 
         if target != *path {
             if let Err(err) = self.tree.relocate(path, &target) {
                 log::warn!("move conflicted copy {path} -> {target}: {err}");
             }
-            let mut ledger = self.ledger();
-            ledger.unobserve(path);
             if let Some(rec) = uploaded {
-                ledger.observe(&target, rec);
+                self.ledger().observe(&target, rec);
             }
         }
         if uploaded.is_some() {
@@ -135,37 +157,9 @@ impl<T: LocalTree> Engine<T> {
                 self.ledger().sign_set(&target, &signature(&data));
             }
         }
-        if target == *path {
-            let entry = self.displaced.lock().unwrap().remove(path);
-            if let Some(d) = entry {
-                if d.rm_pending {
-                    self.rm_displaced(&d.base).await;
-                }
-            }
-        }
         self.tree.settled(&target, after);
         log::info!("uploaded {target} ({} bytes)", md.len());
-        Ok(Upload::Done)
-    }
-
-    fn delta_source(&self, path: &RelPath) -> Option<(Vec<u8>, Option<RelPath>, u64)> {
-        {
-            let ledger = self.ledger();
-            if let Some(sig) = ledger.sign_get(path) {
-                let time = ledger.observations.get(path).map_or(0, |rec| rec.time);
-                return Some((sig, None, time));
-            }
-        }
-        let base = self
-            .displaced
-            .lock()
-            .unwrap()
-            .get(path)
-            .map(|d| d.base.clone())?;
-        let ledger = self.ledger();
-        let sig = ledger.sign_get(&base)?;
-        let time = ledger.observations.get(&base)?.time;
-        Some((sig, Some(base), time))
+        Ok(Replayed::Done)
     }
 }
 

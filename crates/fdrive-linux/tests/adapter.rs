@@ -100,6 +100,11 @@ fn a_delete_storm_lists_each_directory_once() {
         then.status(200)
             .json_body(serde_json::json!({"status": "ok"}));
     });
+    // the removes verify their lease before deleting
+    server.mock(|when, then| {
+        when.method(httpmock::Method::HEAD).path("/api/files/cat");
+        then.status(200).header("content-length", "1");
+    });
     let (rt, data) = (Runtime::new().unwrap(), TempDir::new());
     let adapter = adapter(&server, &data, &rt);
 
