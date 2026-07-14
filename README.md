@@ -34,3 +34,29 @@ We use the hexagonal architecture / ports and adapters pattern. The core owns al
 | `fdrive-mac` | fuse-t |
 | `fdrive-ios` | FileProvider |
 | `fdrive-android` | Storage Access Framework (Kotlin wire, UniFFI) |
+
+## Features
+
+- [X] Sane Architecture: one Rust core makes every decision and each platform only implements the lipstick, so sync behaves the same everywhere
+- [ ] Delta sync: only ship the bytes that changed, not the whole file
+- [X] Lives in the tray: the tray icon shows the status, synced, syncing or in trouble at a glance
+- [X] Files on demand: a file only downloads when you open it, with both content and listings cached so browsing stays snappy and the next open is instant
+- [X] Streaming: large files open immediately, reads are served as the bytes arrive
+- [X] Offline mode: cached files stay readable and editable, changes upload once the link returns
+- [X] Conflict handling: your work is never lost, when both sides changed you get a `(conflicted copy)` so both versions survive
+- [X] Batched uploads: rapid saves coalesce into one upload, and retries back off instead of hammering the server
+- [X] Thumbnails: they are generated on the server through fine tuned C code that works fast!
+- [X] Safe deletes: deletes and renames go to the server first, so an outage never leaves the two sides disagreeing
+- [X] Crash safe: unpushed edits survive crashes and restarts
+- [X] Live view: changes made elsewhere show up in the folder you are browsing, no manual refresh
+- [X] Ignore list: `node_modules`, `.DS_Store` and friends stay home by default, adjustable via `fdrive.toml`
+- [X] Login: done through your server's own login page, password, LDAP, SSO, 2FA all just work
+- [X] No Electron: native everything from the tray, filesystem integration into one single binary
+- [ ] Profiles: connect to several servers / accounts in the same time
+- [ ] Deep integration with Filestash for file locks
+- [ ] Deep integration with Filestash for file versioning
+- [ ] Deep integration with Filestash for search
+- [ ] Explorer actions: surface share links and friends right from the file manager
+- [ ] MacOS FileProvider: fuse-t fills the gap until we pay Apple the $100 a year it takes to get there
+- [ ] Testing: test on all possible devices / configuration
+- [ ] MDM integration: preconfigure the client and roll it out across a fleet
