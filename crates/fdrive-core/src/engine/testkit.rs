@@ -6,8 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use httpmock::MockServer;
 
-use crate::engine::{Engine, LocalTree, Observation};
+use crate::engine::{Engine, Observation};
 use crate::path::RelPath;
+use crate::port::LocalTree;
 use crate::sdk::Sdk;
 
 pub(super) struct TempTree {
