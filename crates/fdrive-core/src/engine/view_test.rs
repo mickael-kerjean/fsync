@@ -59,6 +59,44 @@ async fn overlay_keeps_local_only_files_visible() {
 }
 
 #[tokio::test]
+async fn listed_observes_only_what_the_replica_mirrors() {
+    let server = MockServer::start();
+    let engine = engine(&server);
+    let dir = RelPath::new("");
+    let mtime = httpdate::parse_http_date(MTIME).unwrap();
+    let entry = |name: &str, size: u64| crate::sdk::FileInfo {
+        name: name.into(),
+        kind: crate::sdk::FileType::File,
+        size: Some(size),
+        mtime: Some(mtime),
+    };
+
+    let mirrored = RelPath::new("mirrored");
+    engine.tree().write("mirrored", b"12345");
+    backdate(&engine.tree().dir.join("mirrored"), mtime);
+    let phantom = RelPath::new("phantom");
+
+    engine.listed(&dir, &[entry("mirrored", 5), entry("phantom", 9)]);
+    assert_eq!(
+        engine.observed(&mirrored),
+        Some(observed(5)),
+        "local bytes match the listing, so they agreed"
+    );
+    assert_eq!(
+        engine.observed(&phantom),
+        None,
+        "nothing local, nothing agreed"
+    );
+
+    engine.listed(&dir, &[entry("mirrored", 23)]);
+    assert_eq!(
+        engine.observed(&mirrored),
+        Some(observed(5)),
+        "the server moved on; the baseline must keep the last agreement so freshen sees the drift"
+    );
+}
+
+#[tokio::test]
 async fn content_current_is_the_freshness_rule() {
     let server = MockServer::start();
     let engine = engine(&server);

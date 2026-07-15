@@ -448,8 +448,12 @@ impl Adapter {
                 wire::create_placeholder(&self.root, &child, entry.size.unwrap_or(0), mtime)
             }
         };
-        if let Err(err) = result {
-            log::debug!("place {child}: {err}");
+        match result {
+            Ok(()) if entry.kind == FileType::File => {
+                self.engine.ledger().observe(&child, Observation::of(entry))
+            }
+            Ok(()) => {}
+            Err(err) => log::debug!("place {child}: {err}"),
         }
     }
 
@@ -487,8 +491,12 @@ impl Adapter {
                     Err(err) => log::debug!("adopt {path}: {err}"),
                 }
             }
+            Some(rec) if md.len() == 0 && rec.size > 0 => {
+                log::debug!("{path} is an empty husk of {} observed bytes; leaving it untouched", rec.size);
+            }
             Some(_) => {
-                log::debug!("{path} no longer matches its observation; leaving it untouched");
+                log::info!("adopting local edit {path}");
+                self.engine.modified(path);
             }
             None => self.engine.modified(path),
         }
@@ -511,7 +519,7 @@ impl Adapter {
             remote.size.unwrap_or(0),
             remote.mtime.unwrap_or_else(SystemTime::now),
         ) {
-            Ok(()) => {}
+            Ok(()) => self.engine.ledger().observe(path, remote_rec),
             Err(err) => log::debug!("update {path}: {err}"),
         }
     }
@@ -672,6 +680,7 @@ impl Adapter {
                             Err(err) => log::debug!("dehydrate {child}: {err}"),
                         }
                     }
+                    Ok(FileState::Foreign) => self.adopt(&child, &abs, &md),
                     _ => {}
                 }
             }
