@@ -15,6 +15,7 @@ pub(super) struct TempTree {
     pub(super) dir: PathBuf,
     pub(super) state: PathBuf,
     pub(super) settled: Mutex<Vec<RelPath>>,
+    own: bool,
 }
 
 impl TempTree {
@@ -30,6 +31,16 @@ impl TempTree {
             state: dir.with_extension("ledger.json"),
             dir,
             settled: Mutex::new(Vec::new()),
+            own: true,
+        }
+    }
+
+    pub(super) fn reopen(owner: &TempTree) -> Self {
+        Self {
+            dir: owner.dir.clone(),
+            state: owner.state.clone(),
+            settled: Mutex::new(Vec::new()),
+            own: false,
         }
     }
 
@@ -46,8 +57,10 @@ impl TempTree {
 
 impl Drop for TempTree {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-        let _ = fs::remove_file(&self.state);
+        if self.own {
+            let _ = fs::remove_dir_all(&self.dir);
+            let _ = fs::remove_file(&self.state);
+        }
     }
 }
 

@@ -358,6 +358,7 @@ impl Adapter {
     }
 
     pub fn rmdir(&self, path: &RelPath) -> io::Result<()> {
+        self.invalidate(path);
         match self.ls(path) {
             Ok(listing) if listing.is_empty() => self.delete(path, true),
             Ok(_) => Err(io::Error::from_raw_os_error(libc::ENOTEMPTY)),

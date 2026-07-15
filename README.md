@@ -50,7 +50,7 @@ Inside the core, sync is a journal: filesystem events are recorded, coalesced in
 - [X] Thumbnails: they are generated on the server through fine tuned C code that works fast!
 - [X] Safe deletes: removes and renames carry a lease, they only apply if the server still holds the version you last saw, so nothing you have not seen can ever be destroyed
 - [X] Crash safe: unpushed edits survive crashes and restarts
-- [X] Reset friendly: rage deleting the local db or cache is not undefined behavior
+- [X] Reset friendly: rage deleting the local cache partially or entirely is not undefined behavior
 - [X] Live view: changes made elsewhere show up in the folder you are browsing, no manual refresh
 - [X] Pinning: mark a folder always available offline, it syncs down ahead of time and survives cache cleanup (`setfattr -n user.fdrive.pin -v always <dir>` on linux)
 - [X] Ignore list: `node_modules`, `.DS_Store` and friends stay home by default, adjustable via `fdrive.toml`

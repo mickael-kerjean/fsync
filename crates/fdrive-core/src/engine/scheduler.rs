@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::io;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -67,6 +69,7 @@ async fn run<T: LocalTree>(
     status: watch::Sender<UploadStatus>,
 ) {
     let mut running: JoinSet<(i64, Outcome)> = JoinSet::new();
+    let mut spawned: HashMap<tokio::task::Id, i64> = HashMap::new();
     let mut flushes: Vec<oneshot::Sender<()>> = Vec::new();
     let mut failing = false;
     loop {
@@ -80,10 +83,11 @@ async fn run<T: LocalTree>(
                     break;
                 };
                 let engine = engine.clone();
-                running.spawn(async move {
+                let handle = running.spawn(async move {
                     let result = engine.replay(&plan).await;
                     (seq, result)
                 });
+                spawned.insert(handle.id(), seq);
             }
             let idle = engine.idle() && running.is_empty();
             if idle {
@@ -109,10 +113,18 @@ async fn run<T: LocalTree>(
                     flushes.push(reply);
                 }
             },
-            Some(joined) = running.join_next(), if !running.is_empty() => {
-                let Ok((seq, outcome)) = joined else {
-                    log::error!("a replay task panicked");
-                    continue;
+            Some(joined) = running.join_next_with_id(), if !running.is_empty() => {
+                let (seq, outcome) = match joined {
+                    Ok((id, (seq, outcome))) => {
+                        spawned.remove(&id);
+                        (seq, outcome)
+                    }
+                    Err(err) => {
+                        let Some(seq) = spawned.remove(&err.id()) else {
+                            continue;
+                        };
+                        (seq, Outcome::Failed(io::Error::other("replay panicked")))
+                    }
                 };
                 if let Some(engine) = engine.upgrade() {
                     failing = engine.settle(seq, outcome);

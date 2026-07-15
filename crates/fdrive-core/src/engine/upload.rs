@@ -60,8 +60,16 @@ impl<T: LocalTree> Engine<T> {
             return Outcome::Busy;
         }
         let abs = self.tree.backing(path);
-        let md = match fs::metadata(&abs) {
-            Ok(md) => md,
+        let md = match fs::symlink_metadata(&abs) {
+            Ok(md) if md.is_file() => md,
+            Ok(_) => {
+                log::warn!("upload {path}: the cache entry is not a regular file anymore");
+                return Outcome::Saved {
+                    obs: None,
+                    sig: None,
+                    reedited: false,
+                };
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Outcome::Saved {
                     obs: None,
