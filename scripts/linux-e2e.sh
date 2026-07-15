@@ -146,6 +146,33 @@ settle
 is  "conflict: their version holds the name" "theirs" "$(srv_cat t7/c.txt)"
 has "conflict: ours landed as a copy" "$(srv_ls t7)" "conflicted copy"
 
+# --- 8. a slow save (truncate, think, write) is one upload ------------------
+mkdir -p "$DIR/t8"
+printf 'original content' > "$DIR/t8/slow.txt"
+settle
+mark
+exec 3> "$DIR/t8/slow.txt"   # truncates and stays open, like an exporting app
+sleep 0.6
+printf 'rendered output' >&3
+exec 3>&-
+settle
+is  "slow save: server got the final bytes" "rendered output" "$(srv_cat t8/slow.txt)"
+saves=$(since | grep -c "uploaded e2e-journal/t8/slow.txt")
+is  "slow save: exactly one upload" "1" "$saves"
+
+# --- 9. pinning hydrates without opening ------------------------------------
+mkdir -p "$DIR/t9"
+settle
+srv_save "t9/pinned.txt" "keep me local"
+ls "$DIR/t9/" > /dev/null
+setfattr -n user.fdrive.pin -v always "$DIR/t9"
+sleep 3
+CACHE="$HOME/.local/share/filestash/cache/$E2E/t9/pinned.txt"
+[ -f "$CACHE" ] && ok "pin: content arrived in the cache unopened" || bad "pin: nothing hydrated at $CACHE"
+is  "pin: getfattr answers" "always" "$(getfattr --only-values -n user.fdrive.pin "$DIR/t9" 2>/dev/null)"
+setfattr -n user.fdrive.pin -v auto "$DIR/t9"
+is  "pin: unpin clears the answer" "" "$(getfattr --only-values -n user.fdrive.pin "$DIR/t9" 2>/dev/null)"
+
 # --- cleanup ---------------------------------------------------------------
 rm -rf "$DIR"
 settle

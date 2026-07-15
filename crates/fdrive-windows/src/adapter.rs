@@ -405,8 +405,6 @@ impl Adapter {
         listing: Vec<FileInfo>,
     ) -> io::Result<()> {
         self.engine.listed(dir, &listing);
-        // a listing the server hasn't caught up on must not resurrect a
-        // pending remove's placeholder, nor drop a pending rename's target
         let listing = self.engine.overlay(dir, listing);
         let mut local: BTreeMap<String, fs::Metadata> = BTreeMap::new();
         for entry in fs::read_dir(dir_abs)? {
@@ -660,7 +658,6 @@ impl Adapter {
                 }
                 match self.classify(&abs, &child) {
                     Ok(FileState::Edited) if !self.engine.ledger().dirty.contains(&child) => {
-                        // through the journal, or no intent is ever minted
                         self.engine.modified(&child);
                         armed.push(child);
                     }

@@ -132,8 +132,6 @@ impl<T: LocalTree> Engine<T> {
         if dirty {
             return Ok(());
         }
-        // a deleted-but-not-yet-replayed path is locally gone; a renamed one
-        // still lives upstream under its old name
         let upstream = match self.fates().get(path) {
             Some(super::Fate::Gone) => return Err(io::ErrorKind::NotFound.into()),
             Some(super::Fate::Arrived { from, .. }) => from.clone(),
@@ -208,11 +206,8 @@ impl<T: LocalTree> Engine<T> {
         if let Err(err) = fs::rename(&tmp, self.tree.backing(&path)) {
             return fail(&err);
         }
-        {
-            let mut ledger = self.ledger();
-            ledger.observe(&path, Observation::new(size, info.mtime));
-            ledger.dirty_clear(&path);
-        }
+        self.ledger()
+            .observe(&path, Observation::new(size, info.mtime));
         if let Ok(data) = fs::read(self.tree.backing(&path)) {
             self.ledger()
                 .sign_set(&path, &super::upload::signature(&data));

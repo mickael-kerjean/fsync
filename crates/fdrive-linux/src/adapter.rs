@@ -19,9 +19,11 @@ use crate::xattr::XattrDb;
 struct Handle {
     path: RelPath,
     file: Option<Arc<fs::File>>,
+    writable: bool,
 }
 
 const META_TTL: Duration = Duration::from_secs(5);
+const PIN_XATTR: &str = "user.fdrive.pin";
 
 pub struct CacheTree {
     cache_dir: PathBuf,
@@ -104,6 +106,39 @@ impl Adapter {
         &self.xattrs
     }
 
+    pub fn xattr_set(
+        &self,
+        path: &RelPath,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), fuser::Errno> {
+        if name == PIN_XATTR {
+            match value {
+                b"always" => self.engine.pin(path),
+                b"auto" => self.engine.unpin(path),
+                _ => return Err(fuser::Errno::EINVAL),
+            }
+            return Ok(());
+        }
+        self.xattrs.set(path, name, value, flags)
+    }
+
+    pub fn xattr_get(&self, path: &RelPath, name: &str) -> Option<Vec<u8>> {
+        if name == PIN_XATTR {
+            return self.engine.pinned(path).then(|| b"always".to_vec());
+        }
+        self.xattrs.get(path, name)
+    }
+
+    pub fn xattr_remove(&self, path: &RelPath, name: &str) -> Result<(), fuser::Errno> {
+        if name == PIN_XATTR {
+            self.engine.unpin(path);
+            return Ok(());
+        }
+        self.xattrs.remove(path, name)
+    }
+
     fn prune(&self) -> io::Result<()> {
         self.engine.prune(&self.engine.tree().cache_dir)
     }
@@ -158,8 +193,6 @@ impl Adapter {
         (at.elapsed() < META_TTL).then(|| listing.clone())
     }
 
-    // always through ls(): the raw meta cache doesn't know the journal's
-    // pending fates, serving it unfiltered resurrects tombstoned names
     fn entry(&self, path: &RelPath) -> io::Result<Option<FileInfo>> {
         let parent = path.parent_or_root();
         match self.ls(&parent) {
@@ -213,7 +246,10 @@ impl Adapter {
         self.entry(path).ok().flatten().map(|e| Observation::of(&e))
     }
 
-    pub fn opened(&self, path: &RelPath) -> u64 {
+    pub fn opened(&self, path: &RelPath, writable: bool) -> u64 {
+        if writable {
+            self.engine.write_opened(path);
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -226,6 +262,7 @@ impl Adapter {
             Handle {
                 path: path.clone(),
                 file,
+                writable,
             },
         );
         fh
@@ -233,6 +270,9 @@ impl Adapter {
 
     pub fn closed(&self, fh: u64) {
         if let Some(handle) = self.handles.lock().unwrap().remove(&fh) {
+            if handle.writable {
+                self.engine.write_closed(&handle.path);
+            }
             self.engine.released(&handle.path);
         }
     }

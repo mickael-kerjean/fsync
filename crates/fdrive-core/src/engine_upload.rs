@@ -58,17 +58,10 @@ impl<T: LocalTree> Engine<T> {
         if self.is_frozen(path) {
             return Ok(Replayed::Busy);
         }
-        if self.ignore.matches(path) {
-            // retire the intent but stay dirty so the overlay keeps showing it
-            log::debug!("{path} is ignored");
-            return Ok(Replayed::Done);
-        }
         let abs = self.tree.backing(path);
         let md = match fs::metadata(&abs) {
             Ok(md) => md,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // the bytes vanished locally; a delete is coalescing behind us
-                self.ledger().dirty_clear(path);
                 return Ok(Replayed::Done);
             }
             Err(err) => return Err(err),
@@ -76,8 +69,6 @@ impl<T: LocalTree> Engine<T> {
         let before = md.modified().ok();
         let since = UNIX_EPOCH + Duration::from_secs(replaces.map_or(0, |r| r.time));
 
-        // delta off the cross-path source when the burst revealed one,
-        // else off our own last-synced signature
         let delta = {
             let source = reuses.unwrap_or(path);
             let sig = self.ledger().sign_get(source);
@@ -108,14 +99,12 @@ impl<T: LocalTree> Engine<T> {
                 log::warn!("conflict on {path}: uploading as {target}");
                 match upload_full(&self.sdk, &target, &abs, None).await? {
                     Saved::Done(mtime) => {
-                        self.conflicted(Conflict {
-                            seq: 0,
-                            op: Operation::Write(path.clone()),
-                            expected: replaces,
+                        self.conflicted(Conflict::new(
+                            Operation::Write(path.clone()),
+                            replaces,
                             found,
-                            ours: Some(target.clone()),
-                            at: SystemTime::now(),
-                        });
+                            Some(target.clone()),
+                        ));
                         if let Some(found) = found {
                             self.ledger().observe(path, found);
                         }
@@ -132,16 +121,9 @@ impl<T: LocalTree> Engine<T> {
                 self.ledger().observe(path, rec);
             }
         }
-        {
-            let mut ledger = self.ledger();
-            ledger.dirty_clear(path);
-            ledger.dirty_clear(&target);
-        }
         let after = fs::metadata(&abs).ok().and_then(|md| md.modified().ok());
         if after != before && target == *path {
-            // edited while uploading: a fresh burst takes over
             self.record(Operation::Write(path.clone()));
-            self.ledger().dirty_set(path);
         }
 
         if target != *path {

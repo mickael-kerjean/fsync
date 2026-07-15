@@ -22,8 +22,6 @@ pub(crate) enum Msg {
     Flush(oneshot::Sender<()>),
 }
 
-// dispatches runnable intents; the engine owns the journal, this loop owns
-// the timing
 pub(crate) async fn run<T: LocalTree>(
     engine: Weak<Engine<T>>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
@@ -67,8 +65,7 @@ pub(crate) async fn run<T: LocalTree>(
                 Some(Msg::Kick) => {}
                 Some(Msg::Flush(reply)) => {
                     if let Some(engine) = engine.upgrade() {
-                        engine.journal_tick(true);
-                        engine.hurry();
+                        engine.expedite();
                     }
                     flushes.push(reply);
                 }

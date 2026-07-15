@@ -32,9 +32,9 @@ pub use journal::{Intent, Operation};
 #[path = "engine_test.rs"]
 mod tests;
 
-// a burst is over when it goes quiet; a burst that never quiets flushes anyway
 const WINDOW_QUIET: Duration = Duration::from_millis(250);
 const WINDOW_MAX: Duration = Duration::from_secs(2);
+const OPEN_QUIET: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(10);
 const RETRY_CAP: Duration = Duration::from_secs(300);
 
@@ -53,15 +53,14 @@ pub struct Engine<T: LocalTree> {
     journal: Mutex<Journal>,
     conflicts: Mutex<Vec<Conflict>>,
     conflicts_tx: watch::Sender<usize>,
-    conflicts_rx: watch::Receiver<usize>,
     frozen: Mutex<BTreeSet<RelPath>>,
     weak: Weak<Engine<T>>,
 }
 
-// the journal: a window of raw operations still coalescing, and the net
-// intents awaiting replay
 struct Journal {
     window: Vec<(Instant, Operation)>,
+    marks: BTreeSet<RelPath>,
+    writing: BTreeMap<RelPath, usize>,
     pending: BTreeMap<i64, Pend>,
     inflight: BTreeSet<i64>,
 }
@@ -72,21 +71,122 @@ struct Pend {
     due: Instant,
 }
 
-// how reads should see a path while the server hasn't caught up
+impl Journal {
+    fn load(ledger: &Ledger) -> Self {
+        let (recovered, intents) = ledger.journal_load();
+        let now = Instant::now();
+        Self {
+            marks: recovered.iter().flat_map(op_paths).cloned().collect(),
+            window: recovered.into_iter().map(|op| (now, op)).collect(),
+            writing: BTreeMap::new(),
+            pending: intents
+                .into_iter()
+                .map(|(seq, intent)| {
+                    (
+                        seq,
+                        Pend {
+                            intent,
+                            attempts: 0,
+                            due: now,
+                        },
+                    )
+                })
+                .collect(),
+            inflight: BTreeSet::new(),
+        }
+    }
+
+    fn drain(&mut self, force: bool, stalled: impl Fn(&RelPath) -> bool) -> Vec<Operation> {
+        let now = Instant::now();
+        let quiet = self
+            .window
+            .last()
+            .is_some_and(|(at, _)| now - *at >= WINDOW_QUIET);
+        let aged = self
+            .window
+            .first()
+            .is_some_and(|(at, _)| now - *at >= WINDOW_MAX);
+        if self.window.is_empty() || !(force || quiet || aged) {
+            return Vec::new();
+        }
+        let inflight: Vec<Intent> = self
+            .inflight
+            .iter()
+            .filter_map(|s| self.pending.get(s).map(|p| p.intent.clone()))
+            .collect();
+        let mut held: Vec<(Instant, Operation)> = Vec::new();
+        let mut held_paths: Vec<RelPath> = Vec::new();
+        let mut drained: Vec<Operation> = Vec::new();
+        for (at, op) in std::mem::take(&mut self.window) {
+            let age = now - at;
+            let blocked = op_paths(&op).iter().any(|p| {
+                inflight.iter().any(|i| i.touches(p))
+                    || held_paths
+                        .iter()
+                        .any(|h| h == *p || p.is_descendant_of(h) || h.is_descendant_of(p))
+                    || (!force && age < OPEN_QUIET && self.writing.contains_key(*p))
+                    || (!force && age < WINDOW_MAX && stalled(p))
+            });
+            if blocked {
+                held_paths.extend(op_paths(&op).into_iter().cloned());
+                held.push((at, op));
+            } else {
+                drained.push(op);
+            }
+        }
+        self.window = held;
+        drained
+    }
+
+    fn fold(&mut self, drained: &[Operation]) -> Vec<(i64, Intent)> {
+        let mut seeds: Vec<(i64, Intent)> = Vec::new();
+        loop {
+            let next = self.pending.iter().find(|(seq, pend)| {
+                !self.inflight.contains(seq)
+                    && !seeds.iter().any(|(s, _)| s == *seq)
+                    && (drained
+                        .iter()
+                        .flat_map(op_paths)
+                        .any(|p| pend.intent.touches(p))
+                        || seeds.iter().any(|(_, i)| i.overlaps(&pend.intent)))
+            });
+            match next {
+                Some((seq, _)) => {
+                    let seq = *seq;
+                    seeds.push((seq, self.pending.remove(&seq).unwrap().intent));
+                }
+                None => return seeds,
+            }
+        }
+    }
+
+    fn admit(&mut self, rows: Vec<(i64, Intent)>) {
+        let now = Instant::now();
+        for (seq, intent) in rows {
+            self.pending.insert(
+                seq,
+                Pend {
+                    intent,
+                    attempts: 0,
+                    due: now,
+                },
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fate {
     Gone,
     Arrived { from: RelPath, was: Observation },
 }
 
-// an intent that failed its lease: the handle to revise the auto-resolution
 #[derive(Debug, Clone)]
 pub struct Conflict {
     pub seq: i64,
     pub op: Operation,
     pub expected: Option<Observation>,
     pub found: Option<Observation>,
-    // where our bytes stand now (a conflicted copy); None when we had none
     pub ours: Option<RelPath>,
     pub at: SystemTime,
 }
@@ -99,6 +199,22 @@ pub enum Resolution {
 }
 
 impl Conflict {
+    pub(crate) fn new(
+        op: Operation,
+        expected: Option<Observation>,
+        found: Option<Observation>,
+        ours: Option<RelPath>,
+    ) -> Self {
+        Self {
+            seq: 0,
+            op,
+            expected,
+            found,
+            ours,
+            at: SystemTime::now(),
+        }
+    }
+
     pub(crate) fn what(&self) -> (&'static str, &RelPath, Option<&RelPath>) {
         match &self.op {
             Operation::Create(p) | Operation::Write(p) => ("w", p, None),
@@ -158,7 +274,6 @@ impl Drop for Frozen<'_> {
     }
 }
 
-// the outcome of replaying one intent
 pub(crate) enum Replayed {
     Done,
     Busy,
@@ -182,24 +297,11 @@ impl<T: LocalTree> Engine<T> {
                 (Ledger::open(&ledger_file).unwrap_or_default(), true)
             }
         };
-        let pending: BTreeMap<i64, Pend> = ledger
-            .journal_load()
-            .into_iter()
-            .map(|(seq, intent)| {
-                (
-                    seq,
-                    Pend {
-                        intent,
-                        attempts: 0,
-                        due: Instant::now(),
-                    },
-                )
-            })
-            .collect();
+        let journal = Journal::load(&ledger);
         let conflicts = ledger.conflicts_load();
         let (queue, rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(UploadStatus::Idle);
-        let (conflicts_tx, conflicts_rx) = watch::channel(conflicts.len());
+        let (conflicts_tx, _) = watch::channel(conflicts.len());
         Arc::new_cyclic(|weak| {
             rt.spawn(scheduler::run(weak.clone(), rx, status_tx));
             Self {
@@ -214,14 +316,9 @@ impl<T: LocalTree> Engine<T> {
                 hydrating: Mutex::new(HashMap::new()),
                 downloads: Mutex::new(HashMap::new()),
                 uploading: Mutex::new(HashMap::new()),
-                journal: Mutex::new(Journal {
-                    window: Vec::new(),
-                    pending,
-                    inflight: BTreeSet::new(),
-                }),
+                journal: Mutex::new(journal),
                 conflicts: Mutex::new(conflicts),
                 conflicts_tx,
-                conflicts_rx,
                 frozen: Mutex::new(BTreeSet::new()),
                 weak: weak.clone(),
             }
@@ -249,31 +346,124 @@ impl<T: LocalTree> Engine<T> {
             log::info!("recovered {pending} pending intents");
         }
         self.kick();
+        self.pin_sweep();
     }
 
-    // ---- the journal front door ----
+    pub fn pin(&self, path: &RelPath) {
+        self.ledger().pin_set(path);
+        log::info!("pinned {path}");
+        self.pin_sweep();
+    }
 
-    fn record(&self, op: Operation) {
-        let mut j = self.journal.lock().unwrap();
-        if let Some(last) = j.window.last_mut() {
-            if last.1 == op {
-                last.0 = Instant::now();
-                return;
+    pub fn unpin(&self, path: &RelPath) {
+        self.ledger().pin_clear(path);
+        log::info!("unpinned {path}");
+    }
+
+    pub fn pinned(&self, path: &RelPath) -> bool {
+        self.ledger()
+            .pins
+            .iter()
+            .any(|p| path == p || path.is_descendant_of(p))
+    }
+
+    fn pin_sweep(&self) {
+        let Some(engine) = self.weak.upgrade() else {
+            return;
+        };
+        self.rt.spawn(async move {
+            let roots: Vec<RelPath> = engine.ledger().pins.iter().cloned().collect();
+            for root in roots {
+                engine.hydrate_subtree(&root).await;
+            }
+        });
+    }
+
+    async fn hydrate_subtree(&self, root: &RelPath) {
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            let listing = match self.sdk.ls(&dir.as_dir()).await {
+                Ok(listing) => listing,
+                Err(_) if dir == *root => {
+                    if let Err(err) = self.hydrate(root, None).await {
+                        log::debug!("pin {root}: {err}");
+                    }
+                    return;
+                }
+                Err(err) => {
+                    log::debug!("pin {dir}: {err}");
+                    continue;
+                }
+            };
+            self.listed(&dir, &listing);
+            for entry in listing {
+                let child = dir.join(&entry.name);
+                if child.parent_or_root() != dir {
+                    continue;
+                }
+                match entry.kind {
+                    crate::sdk::FileType::Directory => dirs.push(child),
+                    crate::sdk::FileType::File => {
+                        let hint = Observation::of(&entry);
+                        if self.content_current(&child, hint) {
+                            continue;
+                        }
+                        if let Err(err) = self.hydrate(&child, Some(hint)).await {
+                            log::debug!("pin {child}: {err}");
+                        }
+                    }
+                }
             }
         }
-        j.window.push((Instant::now(), op));
-        drop(j);
+    }
+
+    fn record(&self, op: Operation) {
+        let mark = {
+            let mut j = self.journal.lock().unwrap();
+            if let Some(last) = j.window.last_mut() {
+                if last.1 == op {
+                    last.0 = Instant::now();
+                    return;
+                }
+            }
+            let mark = match &op {
+                Operation::Create(p) | Operation::Write(p) if !j.marks.contains(p) => {
+                    j.marks.insert(p.clone());
+                    Some(p.clone())
+                }
+                _ => None,
+            };
+            j.window.push((Instant::now(), op.clone()));
+            mark
+        };
+        {
+            let mut ledger = self.ledger();
+            if let Some(path) = &mark {
+                ledger.mark(path);
+            }
+            match &op {
+                Operation::Create(p) | Operation::Write(p) => {
+                    ledger.dirty.insert(p.clone());
+                }
+                Operation::Rename(a, b) => {
+                    if ledger.dirty.remove(a) {
+                        ledger.dirty.insert(b.clone());
+                    }
+                }
+                Operation::Delete(p) => {
+                    ledger.dirty.remove(p);
+                }
+            }
+        }
         self.kick();
     }
 
     pub fn modified(&self, path: &RelPath) {
         self.record(Operation::Write(path.clone()));
-        self.ledger().dirty_set(path);
     }
 
     pub fn created(&self, path: &RelPath) {
         self.record(Operation::Create(path.clone()));
-        self.ledger().dirty_set(path);
     }
 
     pub fn released(&self, path: &RelPath) {
@@ -282,9 +472,25 @@ impl<T: LocalTree> Engine<T> {
         }
     }
 
+    pub fn write_opened(&self, path: &RelPath) {
+        let mut j = self.journal.lock().unwrap();
+        *j.writing.entry(path.clone()).or_insert(0) += 1;
+    }
+
+    pub fn write_closed(&self, path: &RelPath) {
+        let mut j = self.journal.lock().unwrap();
+        if let Some(n) = j.writing.get_mut(path) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                j.writing.remove(path);
+            }
+        }
+        drop(j);
+        self.kick();
+    }
+
     pub async fn delete(&self, path: &RelPath, is_dir: bool) -> io::Result<()> {
         if is_dir {
-            // directories stay synchronous: drain the journal under them first
             self.flush(Duration::from_secs(60)).await;
             let _frozen = self.freeze(&[path]);
             self.drain(path, true).await;
@@ -315,147 +521,64 @@ impl<T: LocalTree> Engine<T> {
             return Ok(());
         }
         self.record(Operation::Rename(from.clone(), to.clone()));
-        // pending local bytes follow the file to its new name
-        let mut ledger = self.ledger();
-        if ledger.dirty.contains(from) {
-            ledger.dirty_clear(from);
-            ledger.dirty_set(to);
-        }
         Ok(())
     }
 
-    // fold the finished burst into net intents; `force` drains a still-warm window
     pub(crate) fn journal_tick(&self, force: bool) {
         let (drained, seeds) = {
             let mut j = self.journal.lock().unwrap();
-            if j.window.is_empty() {
-                return;
-            }
-            let now = Instant::now();
-            let quiet = j
-                .window
-                .last()
-                .is_some_and(|(at, _)| now - *at >= WINDOW_QUIET);
-            let aged = j
-                .window
-                .first()
-                .is_some_and(|(at, _)| now - *at >= WINDOW_MAX);
-            if !(force || quiet || aged) {
-                return;
-            }
-            // ops touching an in-flight intent wait for it: their burst isn't
-            // mergeable until the server settles
-            let inflight: Vec<Intent> = j
-                .inflight
-                .iter()
-                .filter_map(|s| j.pending.get(s).map(|p| p.intent.clone()))
-                .collect();
-            let mut held: Vec<(Instant, Operation)> = Vec::new();
-            let mut held_paths: Vec<RelPath> = Vec::new();
-            let mut drained: Vec<Operation> = Vec::new();
-            for (at, op) in std::mem::take(&mut j.window) {
-                let blocked = op_paths(&op).iter().any(|p| {
-                    inflight.iter().any(|i| i.touches(p))
-                        || held_paths
-                            .iter()
-                            .any(|h| h == *p || p.is_descendant_of(h) || h.is_descendant_of(p))
-                });
-                if blocked {
-                    held_paths.extend(op_paths(&op).into_iter().cloned());
-                    held.push((at, op));
-                } else {
-                    drained.push(op);
-                }
-            }
-            j.window = held;
+            let drained = j.drain(force, |p| {
+                self.ledger()
+                    .observations
+                    .get(p)
+                    .is_some_and(|o| o.size > 0)
+                    && fs::metadata(self.tree.backing(p)).is_ok_and(|md| md.len() == 0)
+            });
             if drained.is_empty() {
                 return;
             }
-            // pending intents whose family the burst touches fold with it
-            let mut family: Vec<RelPath> = drained.iter().flat_map(op_paths).cloned().collect();
-            let mut seeds: Vec<i64> = Vec::new();
-            loop {
-                let mut grew = false;
-                for (seq, pend) in &j.pending {
-                    if seeds.contains(seq) || j.inflight.contains(seq) {
-                        continue;
-                    }
-                    if family.iter().any(|p| pend.intent.touches(p)) {
-                        seeds.push(*seq);
-                        let more: Vec<RelPath> = match &pend.intent {
-                            Intent::Save { path, reuses, .. } => std::iter::once(path)
-                                .chain(reuses.iter())
-                                .cloned()
-                                .collect(),
-                            Intent::Move { from, to, .. } => vec![from.clone(), to.clone()],
-                            Intent::Remove { path, .. } => vec![path.clone()],
-                        };
-                        family.extend(more);
-                        grew = true;
-                    }
-                }
-                if !grew {
-                    break;
-                }
-            }
-            let seeds: Vec<(i64, Intent)> = seeds
-                .into_iter()
-                .map(|seq| (seq, j.pending.remove(&seq).unwrap().intent))
-                .collect();
+            let seeds = j.fold(&drained);
             (drained, seeds)
         };
-        let made = {
+        let mut kept: Vec<RelPath> = Vec::new();
+        let made: Vec<Intent> = {
             let ledger = self.ledger();
-            let net =
-                journal::coalesce(journal::seed(seeds.iter().map(|(_, i)| i)), &drained, |p| {
-                    ledger.observations.contains_key(p)
-                });
-            journal::intents(&net, |p| ledger.observations.get(p).copied())
-        };
+            journal::coalesce(journal::seed(seeds.iter().map(|(_, i)| i)), &drained, |p| {
+                ledger.observations.get(p).copied()
+            })
+        }
+        .into_iter()
+        .filter(|intent| match intent {
+            Intent::Save { path, .. } if self.ignore.matches(path) => {
+                kept.push(path.clone());
+                false
+            }
+            _ => true,
+        })
+        .collect();
         log::info!(
             "journal [{}] -> [{}]",
             journal::render(&drained),
             journal::render(&made)
         );
-        let marks: Vec<RelPath> = drained.iter().flat_map(op_paths).cloned().collect();
+        let unmark: Vec<RelPath> = drained
+            .iter()
+            .flat_map(op_paths)
+            .filter(|p| !kept.contains(p))
+            .cloned()
+            .collect();
         let retired: Vec<i64> = seeds.iter().map(|(seq, _)| *seq).collect();
-        let rows = {
-            let mut ledger = self.ledger();
-            let rows = ledger.journal_swap(&marks, &retired, &made);
-            // dirty tracks exactly the saves still owed
-            let saves: BTreeSet<&RelPath> = made
-                .iter()
-                .filter_map(|i| match i {
-                    Intent::Save { path, .. } => Some(path),
-                    _ => None,
-                })
-                .collect();
-            for p in &marks {
-                if !saves.contains(p) {
-                    ledger.dirty.remove(p);
-                }
+        let rows = self.ledger().journal_swap(&unmark, &retired, &made);
+        {
+            let mut j = self.journal.lock().unwrap();
+            for p in &unmark {
+                j.marks.remove(p);
             }
-            for p in saves {
-                ledger.dirty.insert(p.clone());
-            }
-            drop(ledger);
-            rows
-        };
-        let mut j = self.journal.lock().unwrap();
-        let now = Instant::now();
-        for (seq, intent) in rows {
-            j.pending.insert(
-                seq,
-                Pend {
-                    intent,
-                    attempts: 0,
-                    due: now,
-                },
-            );
+            j.admit(rows);
         }
+        self.refresh();
     }
 
-    // an intent may run when it's due and nothing earlier shares its family
     pub(crate) fn next_runnable(&self) -> Option<(i64, Intent)> {
         let mut j = self.journal.lock().unwrap();
         let now = Instant::now();
@@ -485,6 +608,7 @@ impl<T: LocalTree> Engine<T> {
                 j.pending.remove(&seq);
                 drop(j);
                 self.ledger().journal_retire(seq);
+                self.refresh();
                 false
             }
             Ok(Replayed::Busy) => {
@@ -530,7 +654,8 @@ impl<T: LocalTree> Engine<T> {
         }
     }
 
-    pub(crate) fn hurry(&self) {
+    pub(crate) fn expedite(&self) {
+        self.journal_tick(true);
         let mut j = self.journal.lock().unwrap();
         let now = Instant::now();
         for pend in j.pending.values_mut() {
@@ -575,17 +700,14 @@ impl<T: LocalTree> Engine<T> {
                 }
             }
             Ok(info) => {
-                // their edit lives at `from`: it wins the name, ours never lands
                 let found = Observation::of(&info);
                 self.ledger().observe(from, found);
-                self.conflicted(Conflict {
-                    seq: 0,
-                    op: Operation::Rename(from.clone(), to.clone()),
-                    expected: Some(moves),
-                    found: Some(found),
-                    ours: None,
-                    at: SystemTime::now(),
-                });
+                self.conflicted(Conflict::new(
+                    Operation::Rename(from.clone(), to.clone()),
+                    Some(moves),
+                    Some(found),
+                    None,
+                ));
                 Ok(Replayed::Done)
             }
             Err(SdkError::NotFound) => {
@@ -596,22 +718,18 @@ impl<T: LocalTree> Engine<T> {
         }
     }
 
-    // their delete beat our move: save the bytes we hold, surface the rest
     async fn vanished_move(&self, from: &RelPath, to: &RelPath) {
         self.ledger().unobserve(from);
         if self.tree.backing(to).is_file() {
             self.record(Operation::Write(to.clone()));
-            self.ledger().dirty_set(to);
             return;
         }
-        self.conflicted(Conflict {
-            seq: 0,
-            op: Operation::Rename(from.clone(), to.clone()),
-            expected: None,
-            found: None,
-            ours: None,
-            at: SystemTime::now(),
-        });
+        self.conflicted(Conflict::new(
+            Operation::Rename(from.clone(), to.clone()),
+            None,
+            None,
+            None,
+        ));
     }
 
     async fn replay_remove(&self, path: &RelPath, removes: Observation) -> io::Result<Replayed> {
@@ -634,24 +752,19 @@ impl<T: LocalTree> Engine<T> {
                 }
             }
             Ok(info) => {
-                // never delete a version we haven't seen: their edit wins
                 let found = Observation::of(&info);
                 self.ledger().observe(path, found);
-                self.conflicted(Conflict {
-                    seq: 0,
-                    op: Operation::Delete(path.clone()),
-                    expected: Some(removes),
-                    found: Some(found),
-                    ours: None,
-                    at: SystemTime::now(),
-                });
+                self.conflicted(Conflict::new(
+                    Operation::Delete(path.clone()),
+                    Some(removes),
+                    Some(found),
+                    None,
+                ));
                 Ok(Replayed::Done)
             }
             Err(err) => Err(io_err(err)),
         }
     }
-
-    // ---- conflicts ----
 
     pub(crate) fn conflicted(&self, mut c: Conflict) {
         log::warn!("conflict on {}", c.op);
@@ -665,10 +778,9 @@ impl<T: LocalTree> Engine<T> {
     }
 
     pub fn conflict_watch(&self) -> watch::Receiver<usize> {
-        self.conflicts_rx.clone()
+        self.conflicts_tx.subscribe()
     }
 
-    // revising the auto-resolution is just more journal ops
     pub fn resolve(&self, seq: i64, resolution: Resolution) -> io::Result<()> {
         let conflict = {
             let mut conflicts = self.conflicts.lock().unwrap();
@@ -688,7 +800,6 @@ impl<T: LocalTree> Engine<T> {
                 }
             }
             Resolution::Ours => {
-                // we have now seen their version; re-assert ours over it
                 if let (Some(found), Operation::Write(path) | Operation::Delete(path)) =
                     (conflict.found, &conflict.op)
                 {
@@ -698,9 +809,6 @@ impl<T: LocalTree> Engine<T> {
                     (Some(ours), Operation::Write(path)) => {
                         self.tree.relocate(ours, path)?;
                         self.record(Operation::Rename(ours.clone(), path.clone()));
-                        let mut ledger = self.ledger();
-                        ledger.dirty_clear(ours);
-                        ledger.dirty_set(path);
                     }
                     _ => {
                         self.record(conflict.op.clone());
@@ -711,14 +819,13 @@ impl<T: LocalTree> Engine<T> {
         Ok(())
     }
 
-    // ---- the read side: fates ----
-
-    pub fn fates(&self) -> BTreeMap<RelPath, Fate> {
-        let (pending, window): (Vec<Intent>, Vec<Operation>) = {
+    fn view(&self) -> (BTreeMap<RelPath, Fate>, BTreeSet<RelPath>) {
+        let (pending, window, mut dirty): (Vec<Intent>, Vec<Operation>, BTreeSet<RelPath>) = {
             let j = self.journal.lock().unwrap();
             (
                 j.pending.values().map(|p| p.intent.clone()).collect(),
                 j.window.iter().map(|(_, op)| op.clone()).collect(),
+                j.marks.clone(),
             )
         };
         let mut fates: BTreeMap<RelPath, Fate> = BTreeMap::new();
@@ -737,7 +844,9 @@ impl<T: LocalTree> Engine<T> {
         };
         for intent in &pending {
             match intent {
-                Intent::Save { .. } => {}
+                Intent::Save { path, .. } => {
+                    dirty.insert(path.clone());
+                }
                 Intent::Move { from, to, moves } => {
                     arrive(&mut fates, from, to, Some(*moves));
                 }
@@ -750,20 +859,33 @@ impl<T: LocalTree> Engine<T> {
             match op {
                 Operation::Create(p) | Operation::Write(p) => {
                     fates.remove(p);
+                    dirty.insert(p.clone());
                 }
                 Operation::Rename(from, to) => {
                     let was = self.ledger().observations.get(from).copied();
                     arrive(&mut fates, from, to, was);
+                    if dirty.remove(from) {
+                        dirty.insert(to.clone());
+                    }
                 }
                 Operation::Delete(p) => {
                     fates.insert(p.clone(), Fate::Gone);
+                    dirty.remove(p);
                 }
             }
         }
-        fates
+        (fates, dirty)
     }
 
-    // resolve the server-side name a not-yet-moved path still lives under
+    pub fn fates(&self) -> BTreeMap<RelPath, Fate> {
+        self.view().0
+    }
+
+    fn refresh(&self) {
+        let dirty = self.view().1;
+        self.ledger().dirty = dirty;
+    }
+
     pub(crate) fn upstream_of(&self, path: &RelPath) -> Option<RelPath> {
         match self.fates().get(path) {
             Some(Fate::Arrived { from, .. }) => Some(from.clone()),
@@ -771,8 +893,6 @@ impl<T: LocalTree> Engine<T> {
         }
     }
 
-    // a listing is an observation too: without it, files never opened have
-    // no lease and could neither be safely removed nor moved
     pub fn listed(&self, dir: &RelPath, entries: &[FileInfo]) {
         let fates = self.fates();
         let mut ledger = self.ledger();
@@ -781,7 +901,6 @@ impl<T: LocalTree> Engine<T> {
                 continue;
             }
             let path = dir.join(&e.name);
-            // never advance the lease of a path we still owe changes for
             if ledger.dirty.contains(&path) || fates.contains_key(&path) {
                 continue;
             }
@@ -863,35 +982,20 @@ impl<T: LocalTree> Engine<T> {
             fs::create_dir_all(cache_root)?;
             return Ok(());
         }
-        // paths the journal still owes the server stay untouchable
         let owed: BTreeSet<RelPath> = {
             let j = self.journal.lock().unwrap();
             j.pending
                 .values()
-                .flat_map(|p| match &p.intent {
-                    Intent::Save { path, reuses, .. } => std::iter::once(path)
-                        .chain(reuses.iter())
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    Intent::Move { from, to, .. } => vec![from.clone(), to.clone()],
-                    Intent::Remove { path, .. } => vec![path.clone()],
-                })
+                .flat_map(|p| p.intent.paths().into_iter().cloned().collect::<Vec<_>>())
                 .collect()
         };
         let mut ledger = self.ledger();
-        let gone: Vec<RelPath> = ledger
-            .dirty
-            .iter()
-            .filter(|p| !self.tree.backing(p).is_file() && !owed.contains(*p))
-            .cloned()
-            .collect();
-        for path in &gone {
-            ledger.dirty_clear(path);
-        }
+        let pins = ledger.pins.clone();
+        let pinned = |p: &RelPath| pins.iter().any(|r| p == r || p.is_descendant_of(r));
         let gone: Vec<RelPath> = ledger
             .observations
             .keys()
-            .filter(|p| !ledger.dirty.contains(p) && !owed.contains(*p))
+            .filter(|p| !ledger.dirty.contains(p) && !owed.contains(*p) && !pinned(p))
             .cloned()
             .collect();
         for path in &gone {
@@ -901,6 +1005,7 @@ impl<T: LocalTree> Engine<T> {
             .dirty
             .iter()
             .chain(owed.iter())
+            .chain(pins.iter())
             .map(|p| self.tree.backing(p))
             .collect();
         drop(ledger);
@@ -1002,7 +1107,7 @@ fn prune_dir(dir: &Path, keep: &[PathBuf]) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if keep.iter().any(|k| k == &path) {
+        if keep.iter().any(|k| path.starts_with(k)) {
             continue;
         }
         if entry.file_type()?.is_dir() {

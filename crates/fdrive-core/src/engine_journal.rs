@@ -4,7 +4,6 @@ use std::fmt;
 use super::Observation;
 use crate::path::RelPath;
 
-// what the filesystem did, in order
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
     Create(RelPath),
@@ -24,80 +23,41 @@ impl fmt::Display for Operation {
     }
 }
 
-// the net effect of a burst: what must eventually be true upstream
-#[derive(Debug, Clone, PartialEq)]
-pub enum Net {
-    // `from` is the upstream content these bytes descend from, when the
-    // burst itself reveals it (a rename folded into the write)
-    Write {
-        path: RelPath,
-        from: Option<RelPath>,
-    },
-    Rename {
-        from: RelPath,
-        to: RelPath,
-    },
-    Delete(RelPath),
-}
-
-impl fmt::Display for Net {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Net::Write { path, from: None } => write!(f, "w {path}"),
-            Net::Write {
-                path,
-                from: Some(x),
-            } => write!(f, "w {path}<{x}"),
-            Net::Rename { from, to } => write!(f, "mv {from}->{to}"),
-            Net::Delete(p) => write!(f, "rm {p}"),
-        }
-    }
-}
-
-// the promise to the server: each verb owns its lease
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
     Save {
         path: RelPath,
-        // the server version these bytes replace; None = nothing should be there
         replaces: Option<Observation>,
-        // server content the delta may build on (X-Copy-Source)
         reuses: Option<RelPath>,
     },
     Move {
         from: RelPath,
         to: RelPath,
-        // the version being relocated
         moves: Observation,
     },
     Remove {
         path: RelPath,
-        // only this version may die
         removes: Observation,
     },
 }
 
 impl Intent {
-    // the hazard family: intents sharing any of these replay in seq order
-    pub fn touches(&self, p: &RelPath) -> bool {
-        let related = |q: &RelPath| p == q || p.is_descendant_of(q) || q.is_descendant_of(p);
+    pub fn paths(&self) -> Vec<&RelPath> {
         match self {
-            Intent::Save { path, reuses, .. } => {
-                related(path) || reuses.as_ref().is_some_and(related)
-            }
-            Intent::Move { from, to, .. } => related(from) || related(to),
-            Intent::Remove { path, .. } => related(path),
+            Intent::Save { path, reuses, .. } => std::iter::once(path).chain(reuses).collect(),
+            Intent::Move { from, to, .. } => vec![from, to],
+            Intent::Remove { path, .. } => vec![path],
         }
     }
 
+    pub fn touches(&self, p: &RelPath) -> bool {
+        self.paths()
+            .iter()
+            .any(|q| p == *q || p.is_descendant_of(q) || q.is_descendant_of(p))
+    }
+
     pub fn overlaps(&self, other: &Intent) -> bool {
-        match other {
-            Intent::Save { path, reuses, .. } => {
-                self.touches(path) || reuses.as_ref().is_some_and(|r| self.touches(r))
-            }
-            Intent::Move { from, to, .. } => self.touches(from) || self.touches(to),
-            Intent::Remove { path, .. } => self.touches(path),
-        }
+        other.paths().iter().any(|p| self.touches(p))
     }
 }
 
@@ -124,18 +84,13 @@ impl fmt::Display for Intent {
     }
 }
 
-// where each pre-existing piece of content stands mid-burst
 #[derive(Debug, Clone, PartialEq)]
 enum State {
-    // fresh bytes; the upstream path they descend from, when known
     New(Option<RelPath>),
-    // untouched content that entered the burst living at the named path
     Orig(RelPath),
     Gone,
 }
 
-// the working state a burst coalesces onto; seeded from pending intents so
-// consecutive bursts fold together instead of queueing
 #[derive(Default)]
 pub struct Slate {
     origs: Vec<RelPath>,
@@ -176,9 +131,12 @@ pub fn seed<'a>(pending: impl Iterator<Item = &'a Intent>) -> Slate {
     slate
 }
 
-// fold a burst onto the slate and emit its net effect; `known` answers
-// "does this path exist upstream" so only real content earns a tombstone
-pub fn coalesce(mut slate: Slate, ops: &[Operation], known: impl Fn(&RelPath) -> bool) -> Vec<Net> {
+pub fn coalesce(
+    mut slate: Slate,
+    ops: &[Operation],
+    know: impl Fn(&RelPath) -> Option<Observation>,
+) -> Vec<Intent> {
+    let known = |p: &RelPath| know(p).is_some();
     fn touch(slate: &mut Slate, p: &RelPath, known: &impl Fn(&RelPath) -> bool) {
         if known(p) && !slate.content.contains_key(p) && !slate.origs.contains(p) {
             slate.origs.push(p.clone());
@@ -219,101 +177,68 @@ pub fn coalesce(mut slate: Slate, ops: &[Operation], known: impl Fn(&RelPath) ->
             }
         }
     }
-    let mut net = Vec::new();
-    // renames first: they must land before writes clobber their sources
-    for orig in &slate.origs {
-        let survives = slate
-            .content
-            .iter()
-            .find(|(_, st)| **st == State::Orig(orig.clone()))
-            .map(|(p, _)| p.clone());
-        if let Some(to) = survives {
-            if to != *orig {
-                net.push(Net::Rename {
-                    from: orig.clone(),
-                    to,
-                });
-            }
+    let renames: Vec<(RelPath, RelPath)> = slate
+        .origs
+        .iter()
+        .filter_map(|orig| {
+            let to = slate
+                .content
+                .iter()
+                .find(|(_, st)| **st == State::Orig(orig.clone()))
+                .map(|(p, _)| p.clone())?;
+            (to != *orig).then(|| (orig.clone(), to))
+        })
+        .collect();
+    let cyclic = cycle_members(&renames);
+    let mut out = Vec::new();
+    for (from, to) in &renames {
+        match know(from) {
+            Some(moves) if !cyclic.contains(from) => out.push(Intent::Move {
+                from: from.clone(),
+                to: to.clone(),
+                moves,
+            }),
+            _ => out.push(Intent::Save {
+                path: to.clone(),
+                replaces: know(to),
+                reuses: Some(from.clone()).filter(|f| known(f)),
+            }),
         }
     }
-    // then writes, so deletes of their ancestors wait behind them
     for (p, st) in &slate.content {
         if let State::New(from) = st {
-            net.push(Net::Write {
+            out.push(Intent::Save {
                 path: p.clone(),
-                from: from.clone().filter(|x| x != p),
+                replaces: know(p),
+                reuses: from.clone().filter(|x| x != p && known(x)),
             });
         }
     }
-    // deletes last: content that ended nowhere, at a name that ended vacant
-    // (a name that ended occupied dies by overwrite, no tombstone needed)
     for orig in &slate.origs {
         let survives = slate
             .content
             .values()
             .any(|st| *st == State::Orig(orig.clone()));
         if !survives && slate.content.get(orig) == Some(&State::Gone) {
-            net.push(Net::Delete(orig.clone()));
-        }
-    }
-    net
-}
-
-// attach leases: an op becomes an intent only against a version we've seen
-pub fn intents(net: &[Net], know: impl Fn(&RelPath) -> Option<Observation>) -> Vec<Intent> {
-    let renames: Vec<(&RelPath, &RelPath)> = net
-        .iter()
-        .filter_map(|n| match n {
-            Net::Rename { from, to } => Some((from, to)),
-            _ => None,
-        })
-        .collect();
-    let cyclic = cycle_members(&renames);
-    let mut out = Vec::new();
-    for n in net {
-        match n {
-            Net::Rename { from, to } => match know(from) {
-                // a rename cycle (swap) cannot be ordered; each member
-                // degrades to a save of its local bytes, delta'd off the
-                // content that used to live there
-                Some(moves) if !cyclic.contains(from) => out.push(Intent::Move {
-                    from: from.clone(),
-                    to: to.clone(),
-                    moves,
-                }),
-                _ => out.push(Intent::Save {
-                    path: to.clone(),
-                    replaces: know(to),
-                    reuses: Some(from.clone()).filter(|f| know(f).is_some()),
-                }),
-            },
-            Net::Write { path, from } => out.push(Intent::Save {
-                path: path.clone(),
-                replaces: know(path),
-                reuses: from.clone().filter(|f| know(f).is_some()),
-            }),
-            Net::Delete(path) => {
-                // no observation = nothing of ours upstream = vacuous
-                if let Some(removes) = know(path) {
-                    out.push(Intent::Remove {
-                        path: path.clone(),
-                        removes,
-                    });
-                }
+            if let Some(removes) = know(orig) {
+                out.push(Intent::Remove {
+                    path: orig.clone(),
+                    removes,
+                });
             }
         }
     }
     out
 }
 
-fn cycle_members(renames: &[(&RelPath, &RelPath)]) -> BTreeSet<RelPath> {
-    let map: BTreeMap<&RelPath, &RelPath> = renames.iter().copied().collect();
+fn cycle_members(renames: &[(RelPath, RelPath)]) -> BTreeSet<RelPath> {
+    let map: BTreeMap<&RelPath, &RelPath> = renames.iter().map(|(f, t)| (f, t)).collect();
     let mut members = BTreeSet::new();
     for (from, to) in renames {
-        let mut cur = *to;
+        let mut cur = to;
         for _ in 0..renames.len() {
-            if cur == *from {
-                members.insert((*from).clone());
+            if cur == from {
+                members.insert(from.clone());
                 break;
             }
             match map.get(cur) {
@@ -345,49 +270,49 @@ mod tests {
         Observation { size: v, time: v }
     }
 
-    fn net(ops: &[Operation], known: &[&str]) -> Vec<Net> {
+    fn fold(ops: &[Operation], known: &[&str]) -> Vec<Intent> {
         let known: Vec<RelPath> = known.iter().map(|s| p(s)).collect();
-        coalesce(Slate::default(), ops, |q| known.contains(q))
+        coalesce(Slate::default(), ops, |q| {
+            known.contains(q).then(|| obs(q.as_str().len() as u64))
+        })
     }
 
-    fn w(path: &str) -> Net {
-        Net::Write {
+    fn save(path: &str, replaces: Option<&str>, reuses: Option<&str>) -> Intent {
+        Intent::Save {
             path: p(path),
-            from: None,
+            replaces: replaces.map(|r| obs(r.len() as u64)),
+            reuses: reuses.map(p),
         }
     }
 
-    fn wf(path: &str, from: &str) -> Net {
-        Net::Write {
-            path: p(path),
-            from: Some(p(from)),
-        }
-    }
-
-    fn mv(from: &str, to: &str) -> Net {
-        Net::Rename {
+    fn mv(from: &str, to: &str) -> Intent {
+        Intent::Move {
             from: p(from),
             to: p(to),
+            moves: obs(from.len() as u64),
         }
     }
 
-    fn rm(path: &str) -> Net {
-        Net::Delete(p(path))
+    fn rm(path: &str) -> Intent {
+        Intent::Remove {
+            path: p(path),
+            removes: obs(path.len() as u64),
+        }
     }
 
     #[test]
-    fn vim_dance_is_a_write() {
+    fn vim_dance_is_one_save() {
         let ops = [
             Operation::Rename(p("a"), p("a~")),
             Operation::Create(p("a")),
             Operation::Write(p("a")),
             Operation::Delete(p("a~")),
         ];
-        assert_eq!(net(&ops, &["a"]), vec![w("a")]);
+        assert_eq!(fold(&ops, &["a"]), vec![save("a", Some("a"), None)]);
     }
 
     #[test]
-    fn replacefile_dance_is_a_write() {
+    fn replacefile_dance_is_one_save() {
         let ops = [
             Operation::Create(p("t.tmp")),
             Operation::Write(p("t.tmp")),
@@ -395,7 +320,7 @@ mod tests {
             Operation::Rename(p("t.tmp"), p("a")),
             Operation::Delete(p("a~RF.TMP")),
         ];
-        assert_eq!(net(&ops, &["a"]), vec![w("a")]);
+        assert_eq!(fold(&ops, &["a"]), vec![save("a", Some("a"), None)]);
     }
 
     #[test]
@@ -406,13 +331,19 @@ mod tests {
             Operation::Rename(p("x"), p("x_original")),
             Operation::Rename(p("x_tmp"), p("x")),
         ];
-        assert_eq!(net(&ops, &["x"]), vec![mv("x", "x_original"), w("x")]);
+        assert_eq!(
+            fold(&ops, &["x"]),
+            vec![mv("x", "x_original"), save("x", Some("x"), None)]
+        );
     }
 
     #[test]
-    fn rename_then_edit_carries_provenance() {
+    fn rename_then_edit_saves_with_provenance_then_removes() {
         let ops = [Operation::Rename(p("a"), p("b")), Operation::Write(p("b"))];
-        assert_eq!(net(&ops, &["a"]), vec![wf("b", "a"), rm("a")]);
+        assert_eq!(
+            fold(&ops, &["a"]),
+            vec![save("b", None, Some("a")), rm("a")]
+        );
     }
 
     #[test]
@@ -422,13 +353,13 @@ mod tests {
             Operation::Write(p("t.swp")),
             Operation::Delete(p("t.swp")),
         ];
-        assert_eq!(net(&ops, &[]), vec![]);
+        assert_eq!(fold(&ops, &[]), vec![]);
     }
 
     #[test]
-    fn deleted_original_is_a_delete_even_when_edited_first() {
+    fn deleted_original_is_a_remove_even_when_edited_first() {
         let ops = [Operation::Write(p("a")), Operation::Delete(p("a"))];
-        assert_eq!(net(&ops, &["a"]), vec![rm("a")]);
+        assert_eq!(fold(&ops, &["a"]), vec![rm("a")]);
     }
 
     #[test]
@@ -437,24 +368,22 @@ mod tests {
             Operation::Rename(p("a"), p("b")),
             Operation::Rename(p("b"), p("c")),
         ];
-        assert_eq!(net(&ops, &["a"]), vec![mv("a", "c")]);
+        assert_eq!(fold(&ops, &["a"]), vec![mv("a", "c")]);
     }
 
     #[test]
     fn clobbering_chain_tombstones_the_vacated_name() {
-        // c's content lands on a (clobbering it), then moves on to b:
-        // upstream must end with c at b, and a gone
         let ops = [
             Operation::Rename(p("c"), p("a")),
             Operation::Rename(p("a"), p("b")),
         ];
-        assert_eq!(net(&ops, &["a", "c"]), vec![mv("c", "b"), rm("a")]);
+        assert_eq!(fold(&ops, &["a", "c"]), vec![mv("c", "b"), rm("a")]);
     }
 
     #[test]
     fn plain_ops_pass_through() {
         let ops = [Operation::Rename(p("a"), p("b")), Operation::Delete(p("x"))];
-        assert_eq!(net(&ops, &["a", "x"]), vec![mv("a", "b"), rm("x")]);
+        assert_eq!(fold(&ops, &["a", "x"]), vec![mv("a", "b"), rm("x")]);
     }
 
     #[test]
@@ -466,7 +395,7 @@ mod tests {
             Operation::Write(p("a")),
             Operation::Delete(p("a~")),
         ];
-        assert_eq!(net(&ops, &["a"]), vec![w("a")]);
+        assert_eq!(fold(&ops, &["a"]), vec![save("a", Some("a"), None)]);
     }
 
     #[test]
@@ -475,94 +404,62 @@ mod tests {
             Operation::Rename(p("a"), p("a~")),
             Operation::Delete(p("a~")),
         ];
-        // a's content died at a~, which the server never had: rm a is the truth
-        assert_eq!(net(&ops, &["a"]), vec![rm("a")]);
-    }
-
-    #[test]
-    fn intents_carry_leases_and_drop_vacuous_removes() {
-        let know = |q: &RelPath| (q == &p("a")).then(|| obs(3));
-        let made = intents(&[wf("b", "a"), rm("a"), rm("ghost")], know);
-        assert_eq!(
-            made,
-            vec![
-                Intent::Save {
-                    path: p("b"),
-                    replaces: None,
-                    reuses: Some(p("a")),
-                },
-                Intent::Remove {
-                    path: p("a"),
-                    removes: obs(3),
-                },
-            ]
-        );
+        assert_eq!(fold(&ops, &["a"]), vec![rm("a")]);
     }
 
     #[test]
     fn swap_degrades_to_saves() {
-        let know = |q: &RelPath| (q == &p("a") || q == &p("b")).then(|| obs(1));
-        let made = intents(&[mv("a", "b"), mv("b", "a")], know);
+        let ops = [
+            Operation::Rename(p("a"), p("t")),
+            Operation::Rename(p("b"), p("a")),
+            Operation::Rename(p("t"), p("b")),
+        ];
         assert_eq!(
-            made,
+            fold(&ops, &["a", "b"]),
             vec![
-                Intent::Save {
-                    path: p("b"),
-                    replaces: Some(obs(1)),
-                    reuses: Some(p("a")),
-                },
-                Intent::Save {
-                    path: p("a"),
-                    replaces: Some(obs(1)),
-                    reuses: Some(p("b")),
-                },
+                save("b", Some("b"), Some("a")),
+                save("a", Some("a"), Some("b"))
             ]
         );
     }
 
     #[test]
     fn pending_intents_fold_with_the_next_burst() {
-        // pending: save b (was mv a->b + edit); burst: rm b
-        // net truth: a is gone, b never reached the server
-        let pending = [
-            Intent::Save {
-                path: p("b"),
-                replaces: None,
-                reuses: Some(p("a")),
-            },
-            Intent::Remove {
+        let pending = [save("b", None, Some("a")), rm("a")];
+        let ops = [Operation::Delete(p("b"))];
+        let folded = coalesce(seed(pending.iter()), &ops, |q| {
+            (q == &p("a")).then(|| obs(1))
+        });
+        assert_eq!(
+            folded,
+            vec![Intent::Remove {
                 path: p("a"),
                 removes: obs(1),
-            },
-        ];
-        let ops = [Operation::Delete(p("b"))];
-        let folded = coalesce(seed(pending.iter()), &ops, |q| q == &p("a"));
-        assert_eq!(folded, vec![rm("a")]);
+            }]
+        );
     }
 
     #[test]
     fn pending_save_supersedes_on_reedit() {
-        let pending = [Intent::Save {
-            path: p("a"),
-            replaces: Some(obs(1)),
-            reuses: None,
-        }];
+        let pending = [save("a", Some("a"), None)];
         let ops = [Operation::Write(p("a"))];
-        let folded = coalesce(seed(pending.iter()), &ops, |q| q == &p("a"));
-        assert_eq!(folded, vec![w("a")]);
+        let folded = coalesce(seed(pending.iter()), &ops, |q| {
+            (q == &p("a")).then(|| obs(1))
+        });
+        assert_eq!(
+            folded,
+            vec![Intent::Save {
+                path: p("a"),
+                replaces: Some(obs(1)),
+                reuses: None,
+            }]
+        );
     }
 
     #[test]
     fn hazard_overlap_includes_reuses() {
-        let save = Intent::Save {
-            path: p("b"),
-            replaces: None,
-            reuses: Some(p("a")),
-        };
-        let remove = Intent::Remove {
-            path: p("a"),
-            removes: obs(1),
-        };
+        let save = save("b", None, Some("a"));
+        let remove = rm("a");
         assert!(save.overlaps(&remove));
     }
 }

@@ -182,16 +182,19 @@ fn remap_moves_the_subtree_bookkeeping() {
 }
 
 #[test]
-fn journal_persists_pending_writes_across_reopen() {
+fn journal_marks_survive_a_reopen_as_window_writes() {
     let tree = TempTree::new();
     let file = tree.ledger();
     {
         let mut ledger = Ledger::open(&file).unwrap();
-        ledger.dirty_set(&RelPath::new("a/x"));
-        ledger.dirty_set(&RelPath::new("b"));
-        ledger.dirty_clear(&RelPath::new("b"));
+        ledger.mark(&RelPath::new("a/x"));
+        ledger.mark(&RelPath::new("b"));
+        ledger.journal_swap(&[RelPath::new("b")], &[], &[]);
     }
     let ledger = Ledger::open(&file).unwrap();
+    let (window, pending) = ledger.journal_load();
+    assert_eq!(window, vec![super::Operation::Write(RelPath::new("a/x"))]);
+    assert!(pending.is_empty());
     let dirty: Vec<&str> = ledger.dirty.iter().map(|p| p.as_str()).collect();
     assert_eq!(dirty, ["a/x"]);
 }
@@ -222,7 +225,12 @@ fn journal_intents_survive_a_reopen() {
         assert_eq!(rows.len(), 3);
     }
     let ledger = Ledger::open(&file).unwrap();
-    let loaded: Vec<Intent> = ledger.journal_load().into_iter().map(|(_, i)| i).collect();
+    let loaded: Vec<Intent> = ledger
+        .journal_load()
+        .1
+        .into_iter()
+        .map(|(_, i)| i)
+        .collect();
     assert_eq!(loaded, intents);
     assert!(
         ledger.dirty.contains(&RelPath::new("b")),
@@ -244,7 +252,7 @@ fn legacy_dirty_table_seeds_the_journal() {
     }
     let mut ledger = Ledger::open(&file).unwrap();
     assert!(ledger.dirty.contains(&RelPath::new("a/x")));
-    ledger.dirty_clear(&RelPath::new("a/x"));
+    ledger.journal_swap(&[RelPath::new("a/x")], &[], &[]);
     drop(ledger);
     let ledger = Ledger::open(&file).unwrap();
     assert!(ledger.dirty.is_empty(), "the seed happens only once");
@@ -290,8 +298,6 @@ async fn created_keeps_the_lease() {
         "the observation is the lease the save will carry"
     );
 }
-
-// ---- the journal in motion ----
 
 #[tokio::test]
 async fn a_new_file_saves_on_flush() {
@@ -432,6 +438,55 @@ async fn the_backup_dance_moves_then_saves() {
     assert_eq!(keys, ["x", "x_original"]);
     drop(ledger);
     assert!(engine.conflicts().is_empty());
+}
+
+#[tokio::test]
+async fn a_file_open_for_writing_holds_its_save() {
+    let server = MockServer::start();
+    let save = server.mock(|when, then| {
+        when.method(Method::POST).path("/api/files/cat");
+        then.status(200);
+    });
+    let engine = engine(&server);
+    let path = RelPath::new("f");
+    engine.write_opened(&path);
+    engine.tree().write("f", b"half-written");
+    engine.created(&path);
+    engine.modified(&path);
+
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    save.assert_hits(0);
+
+    engine.write_closed(&path);
+    settle(&engine).await;
+    save.assert_hits(1);
+}
+
+#[tokio::test]
+async fn an_emptied_file_waits_for_its_rewrite() {
+    let server = MockServer::start();
+    let save = server.mock(|when, then| {
+        when.method(Method::POST)
+            .path("/api/files/cat")
+            .query_param("path", "/f");
+        then.status(200).header("Last-Modified", MTIME);
+    });
+    let engine = engine(&server);
+    let path = RelPath::new("f");
+    engine
+        .ledger()
+        .observations
+        .insert(path.clone(), observed(5));
+
+    engine.tree().write("f", b"");
+    engine.modified(&path);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    save.assert_hits(0);
+
+    engine.tree().write("f", b"the real bytes");
+    engine.modified(&path);
+    settle(&engine).await;
+    save.assert_hits(1);
 }
 
 #[tokio::test]
@@ -648,13 +703,12 @@ async fn rename_of_an_unuploaded_file_stays_local() {
     let server = MockServer::start();
     let engine = engine(&server);
     let (from, to) = (RelPath::new("f"), RelPath::new("g"));
-    engine.ledger().dirty.insert(from.clone());
+    engine.tree().write("f", b"bytes");
+    engine.modified(&from);
     engine.rename(&from, &to, false).await.unwrap();
     assert!(engine.ledger().dirty.contains(&to));
     assert!(!engine.ledger().dirty.contains(&from));
 }
-
-// ---- conflicts ----
 
 #[tokio::test]
 async fn a_save_conflict_keeps_both_versions() {
@@ -726,8 +780,6 @@ async fn resolving_theirs_removes_our_copy() {
     engine.modified(&path);
     settle(&engine).await;
 
-    // only now may the copy stat succeed: earlier it would have made
-    // conflict_target think the name was taken
     server.mock(|when, then| {
         when.method(Method::HEAD)
             .path("/api/files/cat")
@@ -781,10 +833,7 @@ async fn conflicts_never_clobber_a_local_copy() {
     );
 }
 
-// ---- read-side truth ----
-
 #[tokio::test]
-// a deleted file disappears and a renamed one moves, before the server knows
 async fn overlay_masks_the_pending_world() {
     let server = MockServer::start();
     let engine = engine(&server);
@@ -859,8 +908,6 @@ async fn a_failed_save_keeps_the_debt() {
     save.assert_hits(2);
     assert!(engine.ledger().dirty.contains(&path));
 }
-
-// ---- hydration ----
 
 #[tokio::test]
 async fn concurrent_hydrates_download_once() {
@@ -957,6 +1004,101 @@ async fn a_deleted_file_stops_hydrating() {
         .insert(path.clone(), observed(5));
     engine.delete(&path, false).await.unwrap();
     assert!(engine.hydrate(&path, None).await.is_err());
+}
+
+#[tokio::test]
+async fn an_offline_dir_rename_is_refused_before_touching_anything() {
+    let sdk = Sdk::new("http://127.0.0.1:9").unwrap();
+    let rt = tokio::runtime::Handle::current();
+    let engine = Engine::spawn(Arc::new(sdk), rt, TempTree::new());
+    engine
+        .ledger()
+        .observations
+        .insert(RelPath::new("a/x"), Observation::new(1, None));
+
+    let refused = engine
+        .rename(&RelPath::new("a"), &RelPath::new("z"), true)
+        .await;
+    assert!(refused.is_err(), "the plane rename fails loudly");
+    assert!(
+        engine
+            .ledger()
+            .observations
+            .contains_key(&RelPath::new("a/x")),
+        "nothing was remapped"
+    );
+    assert!(engine.fates().is_empty(), "nothing is pending");
+    assert!(engine.journal_idle(), "nothing was queued to replay later");
+}
+
+#[test]
+fn pins_survive_a_reopen() {
+    let tree = TempTree::new();
+    let file = tree.ledger();
+    {
+        let mut ledger = Ledger::open(&file).unwrap();
+        ledger.pin_set(&RelPath::new("keep"));
+        ledger.pin_set(&RelPath::new("gone"));
+        ledger.pin_clear(&RelPath::new("gone"));
+    }
+    let ledger = Ledger::open(&file).unwrap();
+    let pins: Vec<&str> = ledger.pins.iter().map(|p| p.as_str()).collect();
+    assert_eq!(pins, ["keep"]);
+}
+
+#[tokio::test]
+async fn a_pin_hydrates_the_subtree() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/files/ls")
+            .query_param("path", "/d/");
+        then.status(200).json_body(serde_json::json!({
+            "status": "ok",
+            "results": [{"name": "f.txt", "size": 5, "time": 0, "type": "file"}]
+        }));
+    });
+    let cat = server.mock(|when, then| {
+        when.method(Method::GET)
+            .path("/api/files/cat")
+            .query_param("path", "/d/f.txt");
+        then.status(200).body("hello");
+    });
+    let engine = engine(&server);
+    engine.ledger().pin_set(&RelPath::new("d"));
+    engine.hydrate_subtree(&RelPath::new("d")).await;
+    cat.assert_hits(1);
+    assert_eq!(engine.tree().read("d/f.txt").unwrap(), b"hello");
+    assert!(
+        engine
+            .ledger()
+            .observations
+            .contains_key(&RelPath::new("d/f.txt")),
+        "the walk observed what it listed"
+    );
+
+    engine.hydrate_subtree(&RelPath::new("d")).await;
+    cat.assert_hits(1);
+}
+
+#[tokio::test]
+async fn prune_spares_pinned_content() {
+    let server = MockServer::start();
+    let engine = engine(&server);
+    let root = engine.tree().dir.clone();
+    let path = RelPath::new("d/f.txt");
+    engine.tree().write("d/f.txt", b"hello");
+    engine.ledger().observe(&path, Observation::new(5, None));
+    engine.ledger().pin_set(&RelPath::new("d"));
+
+    engine.prune(&root).unwrap();
+    assert_eq!(engine.tree().read("d/f.txt").unwrap(), b"hello");
+    assert!(engine.ledger().observations.contains_key(&path));
+
+    engine.unpin(&RelPath::new("d"));
+    engine.prune(&root).unwrap();
+    assert!(engine.tree().read("d/f.txt").is_none());
+    assert!(!engine.ledger().observations.contains_key(&path));
 }
 
 #[tokio::test]

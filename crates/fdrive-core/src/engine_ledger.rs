@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::path::RelPath;
 use crate::sdk::FileInfo;
 
-use super::journal::Intent;
+use super::journal::{Intent, Operation};
 use super::Conflict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,7 @@ fn secs(t: Option<SystemTime>) -> u64 {
 pub struct Ledger {
     pub observations: BTreeMap<RelPath, Observation>,
     pub dirty: BTreeSet<RelPath>,
+    pub pins: BTreeSet<RelPath>,
     db: Option<rusqlite::Connection>,
 }
 
@@ -71,6 +72,7 @@ impl Ledger {
                 "CREATE TABLE IF NOT EXISTS observations(path TEXT PRIMARY KEY, size INTEGER NOT NULL, time INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS journal(seq INTEGER PRIMARY KEY, op TEXT NOT NULL, path TEXT NOT NULL, dest TEXT, base TEXT, size INTEGER, time INTEGER);
                  CREATE TABLE IF NOT EXISTS conflicts(seq INTEGER PRIMARY KEY, op TEXT NOT NULL, path TEXT NOT NULL, dest TEXT, expected_size INTEGER, expected_time INTEGER, found_size INTEGER, found_time INTEGER, ours TEXT, at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS pins(path TEXT PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS signatures(path TEXT PRIMARY KEY, sig BLOB NOT NULL);",
             )?;
             // earlier ledgers kept pending uploads in a dirty table
@@ -106,6 +108,12 @@ impl Ledger {
                     let path: String = row.get(0)?;
                     ledger.dirty.insert(RelPath::new(&path));
                 }
+                let mut stmt = db.prepare("SELECT path FROM pins")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let path: String = row.get(0)?;
+                    ledger.pins.insert(RelPath::new(&path));
+                }
             }
             ledger.db = Some(db);
             Ok(ledger)
@@ -125,32 +133,30 @@ impl Ledger {
         }
     }
 
-    pub fn dirty_set(&mut self, path: &RelPath) -> bool {
-        let inserted = self.dirty.insert(path.clone());
-        if inserted {
-            self.exec(
-                "INSERT INTO journal(op, path) VALUES ('w', ?1)",
-                [path.as_str()],
-            );
-        }
-        inserted
-    }
-
-    pub fn dirty_clear(&mut self, path: &RelPath) {
-        if self.dirty.remove(path) {
-            self.exec(
-                "DELETE FROM journal WHERE op = 'w' AND path = ?1",
-                [path.as_str()],
-            );
+    pub fn pin_set(&mut self, path: &RelPath) {
+        if self.pins.insert(path.clone()) {
+            self.exec("INSERT INTO pins(path) VALUES (?1)", [path.as_str()]);
         }
     }
 
-    // pending intents that survived a restart; raw 'w' marks (a crash before
-    // any flush) come back as saves against the last thing we observed
-    pub(crate) fn journal_load(&self) -> Vec<(i64, Intent)> {
+    pub fn pin_clear(&mut self, path: &RelPath) {
+        if self.pins.remove(path) {
+            self.exec("DELETE FROM pins WHERE path = ?1", [path.as_str()]);
+        }
+    }
+
+    pub(crate) fn mark(&self, path: &RelPath) {
+        self.exec(
+            "INSERT INTO journal(op, path) VALUES ('w', ?1)",
+            [path.as_str()],
+        );
+    }
+
+    pub(crate) fn journal_load(&self) -> (Vec<Operation>, Vec<(i64, Intent)>) {
         let Some(db) = &self.db else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        let mut window = Vec::new();
         let mut out = Vec::new();
         let mut read = || -> rusqlite::Result<()> {
             let mut stmt = db.prepare(
@@ -165,11 +171,12 @@ impl Ledger {
                 let base: Option<String> = row.get(4)?;
                 let lease = row_obs(row.get(5)?, row.get(6)?);
                 let intent = match op.as_str() {
-                    "w" => Intent::Save {
-                        replaces: self.observations.get(&path).copied(),
-                        path,
-                        reuses: None,
-                    },
+                    "w" => {
+                        if !window.contains(&Operation::Write(path.clone())) {
+                            window.push(Operation::Write(path));
+                        }
+                        continue;
+                    }
                     "s" => Intent::Save {
                         path,
                         replaces: lease,
@@ -196,14 +203,12 @@ impl Ledger {
         if let Err(err) = read() {
             log::error!("ledger journal: {err}");
         }
-        out
+        (window, out)
     }
 
-    // one transaction: retire superseded intents and the raw marks a burst
-    // consumed, then persist the burst's net intents
     pub(crate) fn journal_swap(
         &mut self,
-        marks: &[RelPath],
+        unmark: &[RelPath],
         retired: &[i64],
         intents: &[Intent],
     ) -> Vec<(i64, Intent)> {
@@ -213,7 +218,7 @@ impl Ledger {
         let mut out = Vec::new();
         let mut write = || -> rusqlite::Result<()> {
             db.execute_batch("BEGIN")?;
-            for path in marks {
+            for path in unmark {
                 db.prepare_cached("DELETE FROM journal WHERE op = 'w' AND path = ?1")?
                     .execute([path.as_str()])?;
             }
@@ -255,7 +260,6 @@ impl Ledger {
         out
     }
 
-    // a ledger without a db still needs unique seqs for the pending map
     fn fallback_seqs(intents: &[Intent]) -> Vec<(i64, Intent)> {
         use std::sync::atomic::{AtomicI64, Ordering};
         static NEXT: AtomicI64 = AtomicI64::new(1 << 40);
