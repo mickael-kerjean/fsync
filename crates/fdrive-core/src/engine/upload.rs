@@ -7,7 +7,8 @@ use crate::path::RelPath;
 use crate::port::LocalTree;
 use crate::sdk::{Error as SdkError, Sdk};
 
-use super::{io_err, Conflict, Engine, Observation, Operation, Replayed};
+use super::{Engine, Outcome};
+use crate::model::{Conflict, Observation, Operation};
 
 enum Saved {
     Done(Option<SystemTime>),
@@ -52,96 +53,104 @@ impl<T: LocalTree> Engine<T> {
         path: &RelPath,
         replaces: Option<Observation>,
         reuses: Option<&RelPath>,
-    ) -> io::Result<Replayed> {
-        let gate = super::gate(&self.uploading, path);
+    ) -> Outcome {
+        let gate = self.transfers.upload_gate(path);
         let _gate = gate.lock().await;
         if self.is_frozen(path) {
-            return Ok(Replayed::Busy);
+            return Outcome::Busy;
         }
         let abs = self.tree.backing(path);
         let md = match fs::metadata(&abs) {
             Ok(md) => md,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(Replayed::Done);
+                return Outcome::Saved {
+                    obs: None,
+                    sig: None,
+                    reedited: false,
+                };
             }
-            Err(err) => return Err(err),
+            Err(err) => return Outcome::Failed(err),
         };
         let before = md.modified().ok();
         let since = UNIX_EPOCH + Duration::from_secs(replaces.map_or(0, |r| r.time));
 
-        let delta = {
-            let source = reuses.unwrap_or(path);
-            let sig = self.ledger().sign_get(source);
-            let time = match reuses {
-                Some(base) => self.ledger().observations.get(base).map(|o| o.time),
-                None => replaces.map(|r| r.time),
-            };
-            match (sig, time) {
-                (Some(sig), Some(time)) => {
-                    let base_since = UNIX_EPOCH + Duration::from_secs(time);
-                    upload_delta(&self.sdk, path, &abs, sig, reuses, base_since).await
-                }
-                _ => None,
-            }
-        };
-        let attempt = match delta {
+        let attempt = match self.try_delta(path, &abs, replaces, reuses).await {
             Some(saved) => saved,
-            None => upload_full(&self.sdk, path, &abs, Some(since)).await?,
+            None => match upload_full(&self.sdk, path, &abs, Some(since)).await {
+                Ok(saved) => saved,
+                Err(err) => return Outcome::Failed(err),
+            },
         };
-        let (target, mtime) = match attempt {
-            Saved::Done(mtime) => (path.clone(), mtime),
-            Saved::Conflict => {
-                let found = match self.sdk.stat(&path.as_file()).await {
-                    Ok(info) => Some(Observation::of(&info)),
-                    Err(_) => None,
-                };
-                let target = self.conflict_target(path).await;
-                log::warn!("conflict on {path}: uploading as {target}");
-                match upload_full(&self.sdk, &target, &abs, None).await? {
-                    Saved::Done(mtime) => {
-                        self.conflicted(Conflict::new(
-                            Operation::Write(path.clone()),
-                            replaces,
-                            found,
-                            Some(target.clone()),
-                        ));
-                        if let Some(found) = found {
-                            self.ledger().observe(path, found);
-                        }
-                        (target, mtime)
-                    }
-                    Saved::Conflict => return Err(io::Error::other("conflict copy was preempted")),
+        match attempt {
+            Saved::Conflict => self.divert(path, replaces, &abs, md.len()).await,
+            Saved::Done(mtime) => {
+                let obs = mtime.map(|m| Observation::new(md.len(), Some(m)));
+                let sig = fs::read(&abs).ok().map(|d| signature(&d));
+                let after = fs::metadata(&abs).ok().and_then(|md| md.modified().ok());
+                self.tree.settled(path, after);
+                log::info!("uploaded {path} ({} bytes)", md.len());
+                Outcome::Saved {
+                    obs,
+                    sig,
+                    reedited: after != before,
                 }
             }
+        }
+    }
+
+    async fn try_delta(
+        &self,
+        path: &RelPath,
+        abs: &Path,
+        replaces: Option<Observation>,
+        reuses: Option<&RelPath>,
+    ) -> Option<Saved> {
+        let source = reuses.unwrap_or(path);
+        let sig = self.ledger().sign_get(source)?;
+        let time = match reuses {
+            Some(base) => self.ledger().observations.get(base).map(|o| o.time),
+            None => replaces.map(|r| r.time),
+        }?;
+        let since = UNIX_EPOCH + Duration::from_secs(time);
+        upload_delta(&self.sdk, path, abs, sig, reuses, since).await
+    }
+
+    async fn divert(
+        &self,
+        path: &RelPath,
+        replaces: Option<Observation>,
+        abs: &Path,
+        len: u64,
+    ) -> Outcome {
+        let theirs = match self.sdk.stat(&path.as_file()).await {
+            Ok(info) => Some(Observation::of(&info)),
+            Err(_) => None,
         };
-        let uploaded = mtime.map(|mtime| Observation::new(md.len(), Some(mtime)));
-
-        if target == *path {
-            if let Some(rec) = uploaded {
-                self.ledger().observe(path, rec);
+        let copy = self.conflict_target(path).await;
+        log::warn!("conflict on {path}: uploading as {copy}");
+        let mtime = match upload_full(&self.sdk, &copy, abs, None).await {
+            Ok(Saved::Done(mtime)) => mtime,
+            Ok(Saved::Conflict) => {
+                return Outcome::Failed(io::Error::other("conflict copy was preempted"))
             }
+            Err(err) => return Outcome::Failed(err),
+        };
+        let after = fs::metadata(abs).ok().and_then(|md| md.modified().ok());
+        if let Err(err) = self.tree.relocate(path, &copy) {
+            log::warn!("move conflicted copy {path} -> {copy}: {err}");
         }
-        let after = fs::metadata(&abs).ok().and_then(|md| md.modified().ok());
-        if after != before && target == *path {
-            self.record(Operation::Write(path.clone()));
+        let sig = fs::read(self.tree.backing(&copy))
+            .ok()
+            .map(|d| signature(&d));
+        self.tree.settled(&copy, after);
+        log::info!("uploaded {copy} ({len} bytes)");
+        Outcome::Diverted {
+            theirs,
+            copy: copy.clone(),
+            obs: mtime.map(|m| Observation::new(len, Some(m))),
+            sig,
+            conflict: Conflict::new(Operation::Write(path.clone()), replaces, theirs, Some(copy)),
         }
-
-        if target != *path {
-            if let Err(err) = self.tree.relocate(path, &target) {
-                log::warn!("move conflicted copy {path} -> {target}: {err}");
-            }
-            if let Some(rec) = uploaded {
-                self.ledger().observe(&target, rec);
-            }
-        }
-        if uploaded.is_some() {
-            if let Ok(data) = fs::read(self.tree.backing(&target)) {
-                self.ledger().sign_set(&target, &signature(&data));
-            }
-        }
-        self.tree.settled(&target, after);
-        log::info!("uploaded {target} ({} bytes)", md.len());
-        Ok(Replayed::Done)
     }
 }
 
@@ -208,9 +217,9 @@ async fn upload_full(
             match sdk.save(&target.as_file(), stream, since).await {
                 Ok(mtime) => Ok(Saved::Done(mtime)),
                 Err(SdkError::PreconditionFailed) => Ok(Saved::Conflict),
-                Err(err) => Err(io_err(err)),
+                Err(err) => Err(err.into()),
             }
         }
-        Err(err) => Err(io_err(err)),
+        Err(err) => Err(err.into()),
     }
 }

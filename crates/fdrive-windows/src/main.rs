@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fdrive_core::config as session;
+use fdrive_core::engine::UploadStatus;
 use fdrive_core::path::RelPath;
-use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::Sdk;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;

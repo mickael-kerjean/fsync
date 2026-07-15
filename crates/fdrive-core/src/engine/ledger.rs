@@ -1,48 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use crate::model::{secs, Conflict, Observation, Operation, Plan};
 use crate::path::RelPath;
-use crate::sdk::FileInfo;
-
-use super::journal::{Intent, Operation};
-use super::Conflict;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Observation {
-    pub size: u64,
-    pub time: u64,
-}
-
-impl Observation {
-    pub fn new(size: u64, mtime: Option<SystemTime>) -> Self {
-        Self {
-            size,
-            time: secs(mtime),
-        }
-    }
-
-    pub fn of(info: &FileInfo) -> Self {
-        Self::new(info.size.unwrap_or(0), info.mtime)
-    }
-
-    pub fn of_local(md: &fs::Metadata) -> Self {
-        Self::new(md.len(), md.modified().ok())
-    }
-}
-
-fn secs(t: Option<SystemTime>) -> u64 {
-    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 #[derive(Default)]
 pub struct Ledger {
     pub observations: BTreeMap<RelPath, Observation>,
-    pub dirty: BTreeSet<RelPath>,
     pub pins: BTreeSet<RelPath>,
+
+    pub dirty: BTreeSet<RelPath>,
+    pub(crate) unreadable: bool,
     db: Option<rusqlite::Connection>,
 }
 
@@ -75,18 +44,6 @@ impl Ledger {
                  CREATE TABLE IF NOT EXISTS pins(path TEXT PRIMARY KEY);
                  CREATE TABLE IF NOT EXISTS signatures(path TEXT PRIMARY KEY, sig BLOB NOT NULL);",
             )?;
-            // earlier ledgers kept pending uploads in a dirty table
-            let legacy: i64 = db.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'dirty'",
-                [],
-                |row| row.get(0),
-            )?;
-            if legacy > 0 {
-                db.execute_batch(
-                    "INSERT INTO journal(op, path) SELECT 'w', path FROM dirty;
-                     DROP TABLE dirty;",
-                )?;
-            }
             let mut ledger = Ledger::default();
             {
                 let mut stmt = db.prepare("SELECT path, size, time FROM observations")?;
@@ -152,7 +109,7 @@ impl Ledger {
         );
     }
 
-    pub(crate) fn journal_load(&self) -> (Vec<Operation>, Vec<(i64, Intent)>) {
+    pub(crate) fn journal_load(&self) -> (Vec<Operation>, Vec<(i64, Plan)>) {
         let Some(db) = &self.db else {
             return (Vec::new(), Vec::new());
         };
@@ -170,20 +127,20 @@ impl Ledger {
                 let dest: Option<String> = row.get(3)?;
                 let base: Option<String> = row.get(4)?;
                 let lease = row_obs(row.get(5)?, row.get(6)?);
-                let intent = match op.as_str() {
+                let plan = match op.as_str() {
                     "w" => {
                         if !window.contains(&Operation::Write(path.clone())) {
                             window.push(Operation::Write(path));
                         }
                         continue;
                     }
-                    "s" => Intent::Save {
+                    "s" => Plan::Save {
                         path,
                         replaces: lease,
                         reuses: base.map(|b| RelPath::new(&b)),
                     },
                     "m" => match (dest, lease) {
-                        (Some(dest), Some(moves)) => Intent::Move {
+                        (Some(dest), Some(moves)) => Plan::Move {
                             from: path,
                             to: RelPath::new(&dest),
                             moves,
@@ -191,12 +148,12 @@ impl Ledger {
                         _ => continue,
                     },
                     "r" => match lease {
-                        Some(removes) => Intent::Remove { path, removes },
+                        Some(removes) => Plan::Remove { path, removes },
                         None => continue,
                     },
                     _ => continue,
                 };
-                out.push((seq, intent));
+                out.push((seq, plan));
             }
             Ok(())
         };
@@ -210,10 +167,10 @@ impl Ledger {
         &mut self,
         unmark: &[RelPath],
         retired: &[i64],
-        intents: &[Intent],
-    ) -> Vec<(i64, Intent)> {
+        plans: &[Plan],
+    ) -> Vec<(i64, Plan)> {
         let Some(db) = &self.db else {
-            return Self::fallback_seqs(intents);
+            return Self::fallback_seqs(plans);
         };
         let mut out = Vec::new();
         let mut write = || -> rusqlite::Result<()> {
@@ -226,15 +183,15 @@ impl Ledger {
                 db.prepare_cached("DELETE FROM journal WHERE seq = ?1")?
                     .execute([seq])?;
             }
-            for intent in intents {
-                let (op, path, dest, base, lease) = match intent {
-                    Intent::Save {
+            for plan in plans {
+                let (op, path, dest, base, lease) = match plan {
+                    Plan::Save {
                         path,
                         replaces,
                         reuses,
                     } => ("s", path, None, reuses.as_ref(), *replaces),
-                    Intent::Move { from, to, moves } => ("m", from, Some(to), None, Some(*moves)),
-                    Intent::Remove { path, removes } => ("r", path, None, None, Some(*removes)),
+                    Plan::Move { from, to, moves } => ("m", from, Some(to), None, Some(*moves)),
+                    Plan::Remove { path, removes } => ("r", path, None, None, Some(*removes)),
                 };
                 db.prepare_cached(
                     "INSERT INTO journal(op, path, dest, base, size, time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -247,7 +204,7 @@ impl Ledger {
                     lease.map(|l| l.size as i64),
                     lease.map(|l| l.time as i64),
                 ])?;
-                out.push((db.last_insert_rowid(), intent.clone()));
+                out.push((db.last_insert_rowid(), plan.clone()));
             }
             db.execute_batch("COMMIT")?;
             Ok(())
@@ -255,17 +212,17 @@ impl Ledger {
         if let Err(err) = write() {
             log::error!("ledger journal: {err}");
             let _ = db.execute_batch("ROLLBACK");
-            return Self::fallback_seqs(intents);
+            return Self::fallback_seqs(plans);
         }
         out
     }
 
-    fn fallback_seqs(intents: &[Intent]) -> Vec<(i64, Intent)> {
+    fn fallback_seqs(plans: &[Plan]) -> Vec<(i64, Plan)> {
         use std::sync::atomic::{AtomicI64, Ordering};
         static NEXT: AtomicI64 = AtomicI64::new(1 << 40);
-        intents
+        plans
             .iter()
-            .map(|intent| (NEXT.fetch_add(1, Ordering::Relaxed), intent.clone()))
+            .map(|plan| (NEXT.fetch_add(1, Ordering::Relaxed), plan.clone()))
             .collect()
     }
 

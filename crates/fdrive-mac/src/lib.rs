@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fdrive_core::engine::{io_err, Engine, Observation};
+use fdrive_core::engine::{Engine, Observation};
 use fdrive_core::path::RelPath;
 use fdrive_core::port::LocalTree;
 use fdrive_core::sdk::{self, FileInfo, FileType, Sdk};
@@ -83,7 +83,7 @@ impl Handle {
                     fetched
                 }
                 Err(err @ (sdk::Error::NotFound | sdk::Error::PermissionDenied)) => {
-                    return Err(io_err(err))
+                    return Err(err.into())
                 }
                 Err(err) => {
                     let meta = self.engine.tree().meta.lock().unwrap();
@@ -92,7 +92,7 @@ impl Handle {
                             log::debug!("ls {dir} unreachable, serving stale: {err}");
                             listing.clone()
                         }
-                        None => return Err(io_err(err)),
+                        None => return Err(err.into()),
                     }
                 }
             },
@@ -199,9 +199,7 @@ impl Handle {
     }
 
     fn mkdir(&self, path: &RelPath) -> io::Result<()> {
-        self.rt
-            .block_on(self.engine.sdk().mkdir(&path.as_dir()))
-            .map_err(io_err)?;
+        self.rt.block_on(self.engine.sdk().mkdir(&path.as_dir()))?;
         self.invalidate(&path.parent_or_root());
         Ok(())
     }
@@ -346,7 +344,7 @@ pub unsafe extern "C" fn fsx_connect(
         ledger: data.join("fdrive.db"),
         meta: Mutex::new(HashMap::new()),
     };
-    let engine = Engine::spawn(Arc::new(sdk), rt.handle().clone(), tree);
+    let engine = Engine::start(Arc::new(sdk), rt.handle().clone(), tree);
     if engine.prune(&engine.tree().cache_dir).is_err() {
         return std::ptr::null_mut();
     }

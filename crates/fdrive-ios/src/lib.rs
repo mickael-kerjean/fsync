@@ -194,7 +194,7 @@ impl Adapter {
             cache_dir: cache_dir.clone(),
             meta: Mutex::new(HashMap::new()),
         };
-        let engine = Engine::spawn(Arc::new(sdk), rt.handle().clone(), tree);
+        let engine = Engine::start(Arc::new(sdk), rt.handle().clone(), tree);
         engine.prune(&cache_dir)?;
         engine.recover();
         Ok(Arc::new(Self { rt, engine }))

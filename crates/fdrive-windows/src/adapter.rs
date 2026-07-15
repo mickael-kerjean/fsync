@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use fdrive_core::engine::{io_err, Engine, Observation};
+use fdrive_core::engine::UploadStatus;
+use fdrive_core::engine::{Engine, Observation};
 use fdrive_core::path::RelPath;
 use fdrive_core::port::LocalTree;
-use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::{Error as SdkError, FileInfo, FileType, Sdk};
 use futures_util::TryStreamExt;
 use tokio::sync::watch;
@@ -117,7 +117,7 @@ impl Adapter {
             suppressed: Mutex::new(BTreeMap::new()),
         };
         Ok(Arc::new(Self {
-            engine: Engine::spawn(sdk, rt, tree),
+            engine: Engine::start(sdk, rt, tree),
             root,
             refreshing: Mutex::new(BTreeMap::new()),
             kept: Mutex::new(BTreeSet::new()),
@@ -233,7 +233,7 @@ impl Adapter {
         const FLUSH_AT: usize = 1 << 20;
         let sdk = self.engine.sdk().clone();
         let api = path.as_file();
-        let info = self.engine.rt().block_on(sdk.stat(&api)).map_err(io_err)?;
+        let info = self.engine.rt().block_on(sdk.stat(&api))?;
         let size = info.size.unwrap_or(0);
         if size as i64 != expected {
             let mtime = info.mtime.unwrap_or_else(SystemTime::now);
@@ -258,7 +258,7 @@ impl Adapter {
         let mut sent: u64 = 0;
         let mut buf: Vec<u8> = Vec::with_capacity(FLUSH_AT + ALIGN);
         self.engine.rt().block_on(async {
-            let (_, mut stream) = sdk.cat(&api).await.map_err(io_err)?;
+            let (_, mut stream) = sdk.cat(&api).await?;
             while let Some(chunk) = stream.try_next().await? {
                 buf.extend_from_slice(&chunk);
                 if buf.len() >= FLUSH_AT {
@@ -291,7 +291,7 @@ impl Adapter {
         {
             Ok(listing) => listing,
             Err(SdkError::NotFound) => return Ok(()),
-            Err(err) => return Err(io_err(err)),
+            Err(err) => return Err(err.into()),
         };
         for entry in &listing {
             self.place(dir, entry);
@@ -392,7 +392,7 @@ impl Adapter {
                     .map_err(io::Error::other)?
             }
             Err(SdkError::NotFound) => Ok(()),
-            Err(err) => Err(io_err(err)),
+            Err(err) => Err(err.into()),
         };
         self.refreshing.lock().unwrap().remove(dir);
         result
