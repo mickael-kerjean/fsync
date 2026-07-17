@@ -6,7 +6,7 @@ mod args;
 mod log;
 
 use fdrive_core::config as session;
-use fdrive_core::scheduler::UploadStatus;
+use fdrive_core::engine::UploadStatus;
 use fdrive_core::sdk::Sdk;
 use fdrive_linux::adapter::Adapter;
 use fdrive_linux::gui::{Credentials, Status, Tray, TrayEvent};

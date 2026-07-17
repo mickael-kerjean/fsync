@@ -86,7 +86,7 @@ fn rmdir_of_an_empty_directory_deletes_it() {
 }
 
 #[test]
-fn a_delete_storm_lists_each_directory_once() {
+fn a_delete_storm_lists_once_plus_the_rmdir_recheck() {
     let server = MockServer::start();
     let ls = ls_mock(
         &server,
@@ -100,6 +100,10 @@ fn a_delete_storm_lists_each_directory_once() {
         then.status(200)
             .json_body(serde_json::json!({"status": "ok"}));
     });
+    server.mock(|when, then| {
+        when.method(httpmock::Method::HEAD).path("/api/files/cat");
+        then.status(200).header("content-length", "1");
+    });
     let (rt, data) = (Runtime::new().unwrap(), TempDir::new());
     let adapter = adapter(&server, &data, &rt);
 
@@ -108,7 +112,7 @@ fn a_delete_storm_lists_each_directory_once() {
         adapter.delete(&RelPath::new(name), false).unwrap();
     }
     adapter.rmdir(&RelPath::new("d")).unwrap();
-    ls.assert_hits(1);
+    ls.assert_hits(2);
     rm.assert_hits(4);
 }
 

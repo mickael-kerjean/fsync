@@ -33,6 +33,16 @@ pub enum Error {
     Url(#[from] url::ParseError),
 }
 
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        match err {
+            Error::NotFound => std::io::ErrorKind::NotFound.into(),
+            Error::PermissionDenied => std::io::ErrorKind::PermissionDenied.into(),
+            err => std::io::Error::other(err),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use fdrive_core::engine::{io_err, Engine, Observation};
+use fdrive_core::engine::UploadStatus;
+use fdrive_core::engine::{Engine, Observation};
 use fdrive_core::path::RelPath;
 use fdrive_core::port::LocalTree;
-use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::{Error as SdkError, FileInfo, FileType, Sdk};
 use futures_util::TryStreamExt;
 use tokio::sync::watch;
@@ -117,7 +117,7 @@ impl Adapter {
             suppressed: Mutex::new(BTreeMap::new()),
         };
         Ok(Arc::new(Self {
-            engine: Engine::spawn(sdk, rt, tree),
+            engine: Engine::start(sdk, rt, tree),
             root,
             refreshing: Mutex::new(BTreeMap::new()),
             kept: Mutex::new(BTreeSet::new()),
@@ -204,7 +204,7 @@ impl Adapter {
         let md = fs::symlink_metadata(abs)?;
         let ps = wire::placeholder_state(abs)?;
         if !ps.placeholder {
-            return Ok(if self.engine.ledger().observations.contains_key(path) {
+            return Ok(if self.engine.observed(path).is_some() {
                 FileState::Foreign
             } else {
                 FileState::New
@@ -233,7 +233,7 @@ impl Adapter {
         const FLUSH_AT: usize = 1 << 20;
         let sdk = self.engine.sdk().clone();
         let api = path.as_file();
-        let info = self.engine.rt().block_on(sdk.stat(&api)).map_err(io_err)?;
+        let info = self.engine.rt().block_on(sdk.stat(&api))?;
         let size = info.size.unwrap_or(0);
         if size as i64 != expected {
             let mtime = info.mtime.unwrap_or_else(SystemTime::now);
@@ -258,7 +258,7 @@ impl Adapter {
         let mut sent: u64 = 0;
         let mut buf: Vec<u8> = Vec::with_capacity(FLUSH_AT + ALIGN);
         self.engine.rt().block_on(async {
-            let (_, mut stream) = sdk.cat(&api).await.map_err(io_err)?;
+            let (_, mut stream) = sdk.cat(&api).await?;
             while let Some(chunk) = stream.try_next().await? {
                 buf.extend_from_slice(&chunk);
                 if buf.len() >= FLUSH_AT {
@@ -291,7 +291,7 @@ impl Adapter {
         {
             Ok(listing) => listing,
             Err(SdkError::NotFound) => return Ok(()),
-            Err(err) => return Err(io_err(err)),
+            Err(err) => return Err(err.into()),
         };
         for entry in &listing {
             self.place(dir, entry);
@@ -392,7 +392,7 @@ impl Adapter {
                     .map_err(io::Error::other)?
             }
             Err(SdkError::NotFound) => Ok(()),
-            Err(err) => Err(io_err(err)),
+            Err(err) => Err(err.into()),
         };
         self.refreshing.lock().unwrap().remove(dir);
         result
@@ -404,6 +404,8 @@ impl Adapter {
         dir_abs: &Path,
         listing: Vec<FileInfo>,
     ) -> io::Result<()> {
+        self.engine.listed(dir, &listing);
+        let listing = self.engine.overlay(dir, listing);
         let mut local: BTreeMap<String, fs::Metadata> = BTreeMap::new();
         for entry in fs::read_dir(dir_abs)? {
             let entry = entry?;
@@ -446,8 +448,12 @@ impl Adapter {
                 wire::create_placeholder(&self.root, &child, entry.size.unwrap_or(0), mtime)
             }
         };
-        if let Err(err) = result {
-            log::debug!("place {child}: {err}");
+        match result {
+            Ok(()) if entry.kind == FileType::File => {
+                self.engine.ledger().observe(&child, Observation::of(entry))
+            }
+            Ok(()) => {}
+            Err(err) => log::debug!("place {child}: {err}"),
         }
     }
 
@@ -474,10 +480,10 @@ impl Adapter {
     }
 
     fn adopt(&self, path: &RelPath, abs: &Path, md: &fs::Metadata) {
-        if self.engine.ledger().dirty.contains(path) {
+        if self.engine.is_dirty(path) {
             return;
         }
-        let observed = self.engine.ledger().observations.get(path).copied();
+        let observed = self.engine.observed(path);
         match observed {
             Some(rec) if Observation::of_local(md) == rec => {
                 match wire::mark_in_sync_if_unmodified(abs, path, md.modified().ok()) {
@@ -485,19 +491,23 @@ impl Adapter {
                     Err(err) => log::debug!("adopt {path}: {err}"),
                 }
             }
+            Some(rec) if md.len() == 0 && rec.size > 0 => {
+                log::debug!("{path} is an empty husk of {} observed bytes; leaving it untouched", rec.size);
+            }
             Some(_) => {
-                log::debug!("{path} no longer matches its observation; leaving it untouched");
+                log::info!("adopting local edit {path}");
+                self.engine.modified(path);
             }
             None => self.engine.modified(path),
         }
     }
 
     fn freshen(&self, path: &RelPath, remote: &FileInfo, md: &fs::Metadata) {
-        if self.engine.ledger().dirty.contains(path) {
+        if self.engine.is_dirty(path) {
             return;
         }
         let remote_rec = Observation::of(remote);
-        let unchanged = match self.engine.ledger().observations.get(path).copied() {
+        let unchanged = match self.engine.observed(path) {
             Some(rec) => rec == remote_rec,
             None => Observation::of_local(md) == remote_rec,
         };
@@ -509,7 +519,7 @@ impl Adapter {
             remote.size.unwrap_or(0),
             remote.mtime.unwrap_or_else(SystemTime::now),
         ) {
-            Ok(()) => {}
+            Ok(()) => self.engine.ledger().observe(path, remote_rec),
             Err(err) => log::debug!("update {path}: {err}"),
         }
     }
@@ -551,7 +561,7 @@ impl Adapter {
             }
         } else if !self.file_is_clean(&abs, path) {
             if matches!(self.classify(&abs, path), Ok(FileState::New))
-                && !self.engine.ledger().dirty.contains(path)
+                && !self.engine.is_dirty(path)
             {
                 log::info!("found new local file {path}");
                 self.engine.modified(path);
@@ -579,7 +589,7 @@ impl Adapter {
     }
 
     fn file_is_clean(&self, abs: &Path, path: &RelPath) -> bool {
-        !self.engine.ledger().dirty.contains(path)
+        !self.engine.is_dirty(path)
             && matches!(
                 self.classify(abs, path),
                 Ok(FileState::Cached(_) | FileState::Dehydrated(_))
@@ -655,7 +665,8 @@ impl Adapter {
                     continue;
                 }
                 match self.classify(&abs, &child) {
-                    Ok(FileState::Edited) if self.engine.ledger().dirty_set(&child) => {
+                    Ok(FileState::Edited) if !self.engine.is_dirty(&child) => {
+                        self.engine.modified(&child);
                         armed.push(child);
                     }
                     Ok(FileState::Dehydrated(Pin::Pinned)) => match wire::set_hydration(&abs, true)
@@ -669,6 +680,7 @@ impl Adapter {
                             Err(err) => log::debug!("dehydrate {child}: {err}"),
                         }
                     }
+                    Ok(FileState::Foreign) => self.adopt(&child, &abs, &md),
                     _ => {}
                 }
             }

@@ -229,7 +229,7 @@ impl Filesystem for MountFs {
             }
             let attr = wire.make_attr(wire.ino(&path), false, 0, SystemTime::now());
             wire.bump(attr.ino.0);
-            let fh = wire.adapter.opened(&path);
+            let fh = wire.adapter.opened(&path, true);
             reply.created(
                 &TTL_OK,
                 &attr,
@@ -251,8 +251,12 @@ impl Filesystem for MountFs {
             } else {
                 wire.adapter.hydrate_start(&path)
             };
+            let writable = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
             match result {
-                Ok(()) => reply.opened(FileHandle(wire.adapter.opened(&path)), FopenFlags::empty()),
+                Ok(()) => reply.opened(
+                    FileHandle(wire.adapter.opened(&path, writable)),
+                    FopenFlags::empty(),
+                ),
                 Err(err) => reply.error(Errno::from(err)),
             }
         });
@@ -411,7 +415,7 @@ impl Filesystem for MountFs {
         let Some(name) = name.to_str() else {
             return reply.error(Errno::EINVAL);
         };
-        match self.wire.adapter.xattrs().set(&path, name, value, flags) {
+        match self.wire.adapter.xattr_set(&path, name, value, flags) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -423,7 +427,7 @@ impl Filesystem for MountFs {
         };
         match name
             .to_str()
-            .and_then(|name| self.wire.adapter.xattrs().get(&path, name))
+            .and_then(|name| self.wire.adapter.xattr_get(&path, name))
         {
             Some(value) => xattr_reply(reply, &value, size),
             None => reply.error(Errno::ENODATA),
@@ -444,7 +448,7 @@ impl Filesystem for MountFs {
         let Some(name) = name.to_str() else {
             return reply.error(Errno::EINVAL);
         };
-        match self.wire.adapter.xattrs().remove(&path, name) {
+        match self.wire.adapter.xattr_remove(&path, name) {
             Ok(()) => reply.ok(),
             Err(errno) => reply.error(errno),
         }
@@ -556,51 +560,5 @@ fn xattr_reply(reply: ReplyXattr, data: &[u8], size: u32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn table() -> InodeTable {
-        InodeTable {
-            paths: HashMap::from([(ROOT, RelPath::root())]),
-            inos: HashMap::from([(RelPath::root(), ROOT)]),
-            lookups: HashMap::new(),
-            next_ino: 2,
-        }
-    }
-
-    #[test]
-    fn an_inode_is_freed_once_the_kernel_forgets_every_lookup() {
-        let mut t = table();
-        let path = RelPath::new("a/b");
-        let ino = t.ino(&path);
-        t.bump(ino);
-        t.bump(ino);
-        assert_eq!(t.paths.get(&ino), Some(&path));
-
-        t.forget(ino, 1);
-        assert_eq!(t.paths.get(&ino), Some(&path), "still referenced once");
-
-        t.forget(ino, 1);
-        assert!(!t.paths.contains_key(&ino), "dropped after the last forget");
-        assert!(!t.inos.contains_key(&path));
-        assert!(!t.lookups.contains_key(&ino));
-    }
-
-    #[test]
-    fn forgetting_an_unlooked_or_root_inode_is_a_noop() {
-        let mut t = table();
-        let ino = t.ino(&RelPath::new("listed-only")); // readdir-style, never bumped
-        t.forget(ino, 1);
-        assert!(
-            t.paths.contains_key(&ino),
-            "no lookup count, nothing to forget"
-        );
-        t.bump(ROOT);
-        t.forget(ROOT, 1);
-        assert_eq!(
-            t.paths.get(&ROOT),
-            Some(&RelPath::root()),
-            "root is never freed"
-        );
-    }
-}
+#[path = "wire_test.rs"]
+mod tests;

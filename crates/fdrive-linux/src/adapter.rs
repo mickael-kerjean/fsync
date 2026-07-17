@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use fdrive_core::engine::{io_err, Engine, Observation};
+use fdrive_core::engine::UploadStatus;
+use fdrive_core::engine::{Engine, Observation};
 use fdrive_core::path::RelPath;
 use fdrive_core::port::LocalTree;
-use fdrive_core::scheduler::UploadStatus;
 use fdrive_core::sdk::{self, FileInfo, FileType, Sdk};
 use tokio::sync::watch;
 
@@ -19,9 +19,11 @@ use crate::xattr::XattrDb;
 struct Handle {
     path: RelPath,
     file: Option<Arc<fs::File>>,
+    writable: bool,
 }
 
 const META_TTL: Duration = Duration::from_secs(5);
+const PIN_XATTR: &str = "user.fdrive.pin";
 
 pub struct CacheTree {
     cache_dir: PathBuf,
@@ -78,7 +80,7 @@ impl Adapter {
             meta: Mutex::new(HashMap::new()),
         };
         let adapter = Self {
-            engine: Engine::spawn(sdk, rt, tree),
+            engine: Engine::start(sdk, rt, tree),
             xattrs: XattrDb::open(data_dir.join("xattr.json")),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -104,6 +106,39 @@ impl Adapter {
         &self.xattrs
     }
 
+    pub fn xattr_set(
+        &self,
+        path: &RelPath,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), fuser::Errno> {
+        if name == PIN_XATTR {
+            match value {
+                b"always" => self.engine.pin(path),
+                b"auto" => self.engine.unpin(path),
+                _ => return Err(fuser::Errno::EINVAL),
+            }
+            return Ok(());
+        }
+        self.xattrs.set(path, name, value, flags)
+    }
+
+    pub fn xattr_get(&self, path: &RelPath, name: &str) -> Option<Vec<u8>> {
+        if name == PIN_XATTR {
+            return self.engine.pinned(path).then(|| b"always".to_vec());
+        }
+        self.xattrs.get(path, name)
+    }
+
+    pub fn xattr_remove(&self, path: &RelPath, name: &str) -> Result<(), fuser::Errno> {
+        if name == PIN_XATTR {
+            self.engine.unpin(path);
+            return Ok(());
+        }
+        self.xattrs.remove(path, name)
+    }
+
     fn prune(&self) -> io::Result<()> {
         self.engine.prune(&self.engine.tree().cache_dir)
     }
@@ -125,6 +160,7 @@ impl Adapter {
                 .block_on(self.engine.sdk().ls(&dir.as_dir()))
             {
                 Ok(fetched) => {
+                    self.engine.listed(dir, &fetched);
                     self.engine
                         .tree()
                         .meta
@@ -134,7 +170,7 @@ impl Adapter {
                     fetched
                 }
                 Err(err @ (sdk::Error::NotFound | sdk::Error::PermissionDenied)) => {
-                    return Err(io_err(err))
+                    return Err(err.into())
                 }
                 Err(err) => {
                     let meta = self.engine.tree().meta.lock().unwrap();
@@ -143,7 +179,7 @@ impl Adapter {
                             log::debug!("ls {dir} unreachable, serving stale: {err}");
                             listing.clone()
                         }
-                        None => return Err(io_err(err)),
+                        None => return Err(err.into()),
                     }
                 }
             },
@@ -159,14 +195,6 @@ impl Adapter {
 
     fn entry(&self, path: &RelPath) -> io::Result<Option<FileInfo>> {
         let parent = path.parent_or_root();
-        {
-            let meta = self.engine.tree().meta.lock().unwrap();
-            if let Some((at, listing)) = meta.get(&parent) {
-                if at.elapsed() < META_TTL {
-                    return Ok(listing.iter().find(|e| e.name == path.name()).cloned());
-                }
-            }
-        }
         match self.ls(&parent) {
             Ok(listing) => Ok(listing.iter().find(|e| e.name == path.name()).cloned()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -218,7 +246,10 @@ impl Adapter {
         self.entry(path).ok().flatten().map(|e| Observation::of(&e))
     }
 
-    pub fn opened(&self, path: &RelPath) -> u64 {
+    pub fn opened(&self, path: &RelPath, writable: bool) -> u64 {
+        if writable {
+            self.engine.write_opened(path);
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -231,6 +262,7 @@ impl Adapter {
             Handle {
                 path: path.clone(),
                 file,
+                writable,
             },
         );
         fh
@@ -238,6 +270,9 @@ impl Adapter {
 
     pub fn closed(&self, fh: u64) {
         if let Some(handle) = self.handles.lock().unwrap().remove(&fh) {
+            if handle.writable {
+                self.engine.write_closed(&handle.path);
+            }
             self.engine.released(&handle.path);
         }
     }
@@ -306,8 +341,7 @@ impl Adapter {
     pub fn mkdir(&self, path: &RelPath) -> io::Result<()> {
         self.engine
             .rt()
-            .block_on(self.engine.sdk().mkdir(&path.as_dir()))
-            .map_err(io_err)?;
+            .block_on(self.engine.sdk().mkdir(&path.as_dir()))?;
         self.invalidate(&path.parent_or_root());
         Ok(())
     }
@@ -324,6 +358,7 @@ impl Adapter {
     }
 
     pub fn rmdir(&self, path: &RelPath) -> io::Result<()> {
+        self.invalidate(path);
         match self.ls(path) {
             Ok(listing) if listing.is_empty() => self.delete(path, true),
             Ok(_) => Err(io::Error::from_raw_os_error(libc::ENOTEMPTY)),
@@ -388,38 +423,5 @@ fn remove_path(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ls_serves_the_stale_listing_when_the_server_is_unreachable() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let data = std::env::temp_dir().join(format!("fdrive-stale-ls-{}", std::process::id()));
-        fs::create_dir_all(&data).unwrap();
-        let sdk = Sdk::new("http://127.0.0.1:9").unwrap();
-        let adapter = Adapter::new(Arc::new(sdk), rt.handle().clone(), &data).unwrap();
-
-        let dir = RelPath::new("d");
-        let expired = Instant::now()
-            .checked_sub(Duration::from_secs(600))
-            .unwrap();
-        adapter.engine.tree().meta.lock().unwrap().insert(
-            dir.clone(),
-            (
-                expired,
-                vec![FileInfo {
-                    name: "a.txt".to_string(),
-                    kind: FileType::File,
-                    size: Some(1),
-                    mtime: None,
-                }],
-            ),
-        );
-
-        let listing = adapter.ls(&dir).unwrap();
-        assert_eq!(listing.len(), 1);
-        assert_eq!(listing[0].name, "a.txt");
-        assert!(adapter.ls(&RelPath::new("never-seen")).is_err());
-        let _ = fs::remove_dir_all(&data);
-    }
-}
+#[path = "adapter_test.rs"]
+mod tests;

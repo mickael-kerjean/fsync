@@ -12,7 +12,8 @@ use crate::port::LocalTree;
 
 use crate::sdk::Error as SdkError;
 
-use super::{io_err, Engine, Observation};
+use super::Engine;
+use crate::model::{Fate, Observation};
 
 fn part_file(abs: &Path) -> PathBuf {
     use std::sync::atomic::AtomicU64;
@@ -94,7 +95,7 @@ fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 impl<T: LocalTree> Engine<T> {
     pub async fn hydrate(&self, path: &RelPath, current: Option<Observation>) -> io::Result<()> {
         self.hydrate_start(path, current).await?;
-        let download = self.downloads.lock().unwrap().get(path).cloned();
+        let download = self.transfers.downloads.lock().unwrap().get(path).cloned();
         match download {
             Some(download) => download.done().await,
             None => Ok(()),
@@ -106,7 +107,7 @@ impl<T: LocalTree> Engine<T> {
         path: &RelPath,
         current: Option<Observation>,
     ) -> io::Result<()> {
-        let gate = super::gate(&self.hydrating, path);
+        let gate = self.transfers.hydrate_gate(path);
         let _gate = gate.lock().await;
         self.fetch_start(path, current).await
     }
@@ -115,11 +116,11 @@ impl<T: LocalTree> Engine<T> {
         if self.ledger().dirty.contains(path) {
             return None;
         }
-        self.downloads.lock().unwrap().get(path).cloned()
+        self.transfers.downloads.lock().unwrap().get(path).cloned()
     }
 
     async fn fetch_start(&self, path: &RelPath, current: Option<Observation>) -> io::Result<()> {
-        if self.downloads.lock().unwrap().contains_key(path) {
+        if self.transfers.downloads.lock().unwrap().contains_key(path) {
             return Ok(());
         }
         let (observed, dirty) = {
@@ -132,19 +133,24 @@ impl<T: LocalTree> Engine<T> {
         if dirty {
             return Ok(());
         }
+        let upstream = match self.fates().get(path) {
+            Some(Fate::Gone) => return Err(io::ErrorKind::NotFound.into()),
+            Some(Fate::Arrived { from, .. }) => from.clone(),
+            None => path.clone(),
+        };
         let abs = self.tree.backing(path);
         let current = match current {
             Some(current) => current,
-            None => match self.sdk.stat(&path.as_file()).await {
+            None => match self.sdk.stat(&upstream.as_file()).await {
                 Ok(info) => Observation::of(&info),
                 Err(err @ (SdkError::NotFound | SdkError::PermissionDenied)) => {
-                    return Err(io_err(err))
+                    return Err(err.into())
                 }
                 Err(err) if abs.is_file() => {
                     log::debug!("hydrate {path} unreachable, serving the cache: {err}");
                     return Ok(());
                 }
-                Err(err) => return Err(io_err(err)),
+                Err(err) => return Err(err.into()),
             },
         };
         if observed == Some(current) && abs.is_file() {
@@ -157,12 +163,13 @@ impl<T: LocalTree> Engine<T> {
         fs::File::create(&tmp)?;
         let file = fs::File::open(&tmp)?;
         let (tx, state) = watch::channel((0u64, DownloadStatus::Running));
-        self.downloads
+        self.transfers
+            .downloads
             .lock()
             .unwrap()
             .insert(path.clone(), Arc::new(Download { file, state }));
-        let engine = self.weak.upgrade().expect("engine is alive");
-        self.rt.spawn(engine.stream(path.clone(), tmp, tx));
+        self.spawner
+            .spawn(|engine| engine.stream(path.clone(), tmp, tx));
         Ok(())
     }
 
@@ -175,11 +182,12 @@ impl<T: LocalTree> Engine<T> {
         let fail = |err: &dyn std::fmt::Display| {
             log::warn!("hydrate {path}: {err}");
             let _ = fs::remove_file(&tmp);
-            self.downloads.lock().unwrap().remove(&path);
+            self.transfers.downloads.lock().unwrap().remove(&path);
             tx.send_modify(|s| s.1 = DownloadStatus::Failed);
         };
         let downloaded = async {
-            let (info, mut stream) = self.sdk.cat(&path.as_file()).await.map_err(io_err)?;
+            let upstream = self.upstream_of(&path).unwrap_or_else(|| path.clone());
+            let (info, mut stream) = self.sdk.cat(&upstream.as_file()).await?;
             let mut file = fs::File::options().append(true).open(&tmp)?;
             let mut size: u64 = 0;
             while let Some(chunk) = stream.try_next().await? {
@@ -200,16 +208,13 @@ impl<T: LocalTree> Engine<T> {
         if let Err(err) = fs::rename(&tmp, self.tree.backing(&path)) {
             return fail(&err);
         }
-        {
-            let mut ledger = self.ledger();
-            ledger.observe(&path, Observation::new(size, info.mtime));
-            ledger.dirty_clear(&path);
-        }
+        self.ledger()
+            .observe(&path, Observation::new(size, info.mtime));
         if let Ok(data) = fs::read(self.tree.backing(&path)) {
             self.ledger()
                 .sign_set(&path, &super::upload::signature(&data));
         }
-        self.downloads.lock().unwrap().remove(&path);
+        self.transfers.downloads.lock().unwrap().remove(&path);
         tx.send_modify(|s| s.1 = DownloadStatus::Done);
         log::info!("cached {path} ({size} bytes)");
     }
